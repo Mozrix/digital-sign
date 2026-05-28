@@ -49,7 +49,7 @@ npm install
 npm run dev
 ```
 
-🔒 Alur Penggunaan
+### 🔒 Alur Penggunaan
 Registrasi & Login: Daftar akun baru menggunakan email.
 
 Setup 2FA: Pindai QR Code di aplikasi untuk mengaktifkan Google Authenticator.
