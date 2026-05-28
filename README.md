@@ -38,6 +38,8 @@ cd backend
 go mod tidy
 # Jalankan server
 go run main.go
+```
+
 
 3. Menjalankan Frontend (React)
 Buka terminal baru, arahkan ke folder frontend, lalu jalankan perintah berikut:
@@ -45,3 +47,15 @@ Buka terminal baru, arahkan ke folder frontend, lalu jalankan perintah berikut:
 cd frontend
 npm install
 npm run dev
+```
+
+🔒 Alur Penggunaan
+Registrasi & Login: Daftar akun baru menggunakan email.
+
+Setup 2FA: Pindai QR Code di aplikasi untuk mengaktifkan Google Authenticator.
+
+Request Digital ID: Lakukan pengajuan identitas digital untuk mendapatkan file .p12.
+
+Sign Document: Unggah PDF, masukkan passphrase, dan lampirkan gambar tanda tangan.
+
+Verifikasi: Unggah dokumen untuk memastikan keaslian dan mendeteksi apakah dokumen pernah diduplikasi.
