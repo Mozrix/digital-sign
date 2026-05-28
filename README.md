@@ -41,7 +41,7 @@ go run main.go
 ```
 
 
-3. Menjalankan Frontend (React)
+### 3. Menjalankan Frontend (React)
 Buka terminal baru, arahkan ke folder frontend, lalu jalankan perintah berikut:
 ```bash
 cd frontend
