@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { QRCodeCanvas } from 'qrcode.react';
 import axios from 'axios';
+import SignDocument from './SignDocument';
 
 // --- TEMA & STYLING MINIMALIS ---
 const theme = {
@@ -45,6 +46,16 @@ function App() {
   // State untuk Verifikasi Dokumen
   const [verifyFile, setVerifyFile] = useState(null);
   const [verifyResult, setVerifyResult] = useState(null);
+
+  const [signaturePos, setSignaturePos] = useState({ page: 1, x: 100, y: 150 });
+
+  const handlePdfClick = (e) => {
+  const rect = e.target.getBoundingClientRect();
+  const clickX = e.clientX - rect.left; // Koordinat X lokal
+  const clickY = rect.bottom - e.clientY; // Koordinat Y (dibalik karena pdfcpu membaca dari bawah-kiri)
+
+  setSignaturePos({ ...signaturePos, x: Math.round(clickX), y: Math.round(clickY) });
+};
 
   const fetchHistory = async () => {
     try {
@@ -167,6 +178,10 @@ function App() {
     formData.append('otpCode', signData.otp);
     formData.append('passphrase', signData.passphrase);
     formData.append('signerName', signData.signerName);
+
+    formData.append("page", signaturePos.page); 
+    formData.append("x", signaturePos.x);
+    formData.append("y", signaturePos.y);
     
     // Append File Wajib
     if (signData.file) {
@@ -191,17 +206,23 @@ function App() {
   };
 
   const handleRequestID = async (e) => {
-    e.preventDefault();
-    try {
-      const response = await axios.post('http://localhost:8081/request-id', { ...reqData, email }, { responseType: 'blob' });
-      const link = document.createElement('a');
-      link.href = window.URL.createObjectURL(new Blob([response.data]));
-      link.setAttribute('download', `${email}_digital_id.p12`);
-      document.body.appendChild(link); link.click();
-      alert("Digital ID berhasil diunduh.");
-    } catch (err) { alert("Gagal membuat ID."); }
-  };
-
+      e.preventDefault();
+      try {
+        const response = await axios.post('http://localhost:8081/request-id', { ...reqData, email }, { responseType: 'blob' });
+        
+        const link = document.createElement('a');
+        link.href = window.URL.createObjectURL(new Blob([response.data]));
+        link.setAttribute('download', `${email}_digital_id.p12`);
+        document.body.appendChild(link); 
+        link.click();
+        
+        alert("Digital ID (.p12) berhasil dibuat dan diunduh. Anda sekarang dapat menggunakannya di platform ini maupun di-import ke Adobe Acrobat.");
+      } catch (err) { 
+        // KODE BARU: Membaca teks error blob dari backend
+        const errorText = await err.response?.data.text();
+        alert(errorText || "Gagal membuat ID."); 
+      }
+    };
   // ==========================================
   // RENDER TAMPILAN
   // ==========================================
@@ -303,73 +324,7 @@ function App() {
           
           {/* MENU 1: SIGN/UPLOAD DOCUMENT */}
           {activeMenu === 'upload' && (
-            <div>
-              <h2 style={{ marginBottom: '10px' }}>Upload & Sign Document</h2>
-              <p style={{ color: theme.textMuted, marginBottom: '30px' }}>Lengkapi data di bawah ini untuk membubuhkan tanda tangan digital bersertifikat pada dokumen Anda.</p>
-              
-              <form onSubmit={handleSignDocument}>
-                
-                {/* 1. Upload Dokumen PDF */}
-                <div style={{ padding: '15px', border: `1px solid ${theme.border}`, borderRadius: '8px', marginBottom: '20px', backgroundColor: '#F9FAFB' }}>
-                  <label style={{ display: 'block', fontWeight: '600', marginBottom: '5px' }}>Upload Dokumen PDF <span style={{ color: '#E11D48' }}>*</span></label>
-                  <p style={{ fontSize: '12px', color: theme.textMuted, margin: '0 0 10px 0' }}>File PDF, Maksimal ukuran file 5MB.</p>
-                  <input 
-                    type="file" 
-                    accept="application/pdf" 
-                    required 
-                    style={{ ...styles.input, padding: '8px', backgroundColor: 'white', marginBottom: '0' }} 
-                    onChange={handlePdfUpload} 
-                  />
-                </div>
-
-                {/* 2. Nama Penandatangan */}
-                <label style={{ display: 'block', fontWeight: '500', marginBottom: '8px' }}>Nama Penandatangan <span style={{ color: '#E11D48' }}>*</span></label>
-                <input 
-                  type="text" 
-                  required 
-                  style={styles.input} 
-                  placeholder="Masukkan nama lengkap" 
-                  value={signData.signerName}
-                  onChange={e => setSignData({...signData, signerName: e.target.value})} 
-                />
-
-                {/* 3. Gambar Tanda Tangan (Opsional) */}
-                <label style={{ display: 'block', fontWeight: '500', marginBottom: '5px' }}>Gambar Tanda Tangan (Opsional)</label>
-                <p style={{ fontSize: '12px', color: theme.textMuted, margin: '0 0 8px 0' }}>Format PNG, JPG, atau JPEG.</p>
-                <input 
-                  type="file" 
-                  accept="image/png, image/jpeg, image/jpg" 
-                  style={{ ...styles.input, padding: '8px' }} 
-                  onChange={e => setSignData({...signData, signatureImage: e.target.files[0]})} 
-                />
-                
-                <div style={{ margin: '20px 0', borderBottom: `1px dashed ${theme.border}` }}></div>
-
-                {/* 4. Keamanan / Otentikasi */}
-                <label style={{ display: 'block', fontWeight: '500', marginBottom: '8px' }}>Passphrase Sertifikat (.p12) <span style={{ color: '#E11D48' }}>*</span></label>
-                <input 
-                  type="password" 
-                  required 
-                  style={styles.input} 
-                  placeholder="Masukkan Passphrase" 
-                  value={signData.passphrase}
-                  onChange={e => setSignData({...signData, passphrase: e.target.value})} 
-                />
-                
-                <label style={{ display: 'block', fontWeight: '500', marginBottom: '8px' }}>Kode OTP <span style={{ color: '#E11D48' }}>*</span></label>
-                <input 
-                  type="text" 
-                  maxLength="6" 
-                  required 
-                  style={{ ...styles.input, letterSpacing: '2px' }} 
-                  placeholder="6 Digit OTP dari Google Authenticator" 
-                  value={signData.otp}
-                  onChange={e => setSignData({...signData, otp: e.target.value})} 
-                />
-                
-                <button type="submit" style={{ ...styles.btn, width: '100%', marginTop: '10px' }}>Proses Tanda Tangan Digital</button>
-              </form>
-            </div>
+            <SignDocument userEmail={email} />
           )}
 
         {/* MENU 2: RIWAYAT DOCUMENT */}

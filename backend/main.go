@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -52,6 +53,12 @@ type HistoryItem struct {
 	DocumentName string `json:"document_name"`
 	SignerName   string `json:"signer_name"`
 	SignedAt     string `json:"signed_at"`
+}
+
+type UpdateStatusPayload struct {
+	RequestID int    `json:"request_id"`
+	Field     string `json:"field"` // "is_approve", "is_ready", "is_sent", "is_revoke"
+	Value     bool   `json:"value"`
 }
 
 func initDB() {
@@ -148,20 +155,34 @@ func resetOTPHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "OTP direset.")
 }
 
-// 6. Request Digital ID
+// 6. Request Digital ID (Dibatasi Hanya Bisa 1 Kali Set Passphrase)
 func requestDigitalIDHandler(w http.ResponseWriter, r *http.Request) {
 	var payload RequestIDPayload
 	json.NewDecoder(r.Body).Decode(&payload)
+
+	// --- LOGIKA BARU: VALIDASI PENGATURAN 1 KALI ---
+	var existingName sql.NullString
+	db.QueryRow("SELECT name FROM users WHERE email = ?", payload.Email).Scan(&existingName)
+	if existingName.Valid && existingName.String != "" {
+		http.Error(w, "Gagal: Akun Anda sudah pernah mengatur Passphrase Identitas Digital. Pembuatan ulang tidak diizinkan.", http.StatusBadRequest)
+		return
+	}
+	// -----------------------------------------------
+
+	// Jika belum pernah buat, update nama dan generate .p12
 	db.Exec("UPDATE users SET name = ? WHERE email = ?", payload.Name, payload.Email)
 
 	privateKey, _ := rsa.GenerateKey(rand.Reader, 2048)
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().Unix()),
 		Subject:      pkix.Name{CommonName: payload.Name},
-		NotBefore:    time.Now(), NotAfter: time.Now().AddDate(2, 0, 0),
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().AddDate(2, 0, 0), // Expired Date otomatis 2 tahun standar global
 	}
 	certBytes, _ := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
 	cert, _ := x509.ParseCertificate(certBytes)
+
+	// Encode sertifikat menjadi identitas digital (.p12) yang kompatibel penuh dengan Adobe Acrobat
 	pfxData, _ := pkcs12.Encode(rand.Reader, privateKey, cert, nil, payload.Passphrase)
 
 	w.Header().Set("Content-Type", "application/x-pkcs12")
@@ -170,6 +191,7 @@ func requestDigitalIDHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // 7. Web Sign (Dengan Pencegahan Duplikat, Injeksi Gambar, & Injeksi Nama)
+// 7. Web Sign (Dengan Koordinat Dinamis & Halaman Manual)
 func webSignHandler(w http.ResponseWriter, r *http.Request) {
 	err := r.ParseMultipartForm(10 << 20)
 	if err != nil {
@@ -180,6 +202,11 @@ func webSignHandler(w http.ResponseWriter, r *http.Request) {
 	email := r.FormValue("email")
 	otpCode := r.FormValue("otpCode")
 	signerName := r.FormValue("signerName")
+
+	// --- TANGKAP INPUT POSISI MANUAL DARI FRONTEND ---
+	targetPage := r.FormValue("page") // Contoh: "1", "2", "3"
+	xCoord := r.FormValue("x")        // Koordinat X dari klik mouse
+	yCoord := r.FormValue("y")        // Koordinat Y dari klik mouse
 
 	var secret sql.NullString
 	db.QueryRow("SELECT otp_secret FROM users WHERE email = ?", email).Scan(&secret)
@@ -195,29 +222,17 @@ func webSignHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer pdfFile.Close()
 
-	// --- PENGECEKAN DUPLIKASI SAAT UPLOAD ---
-	var existing int
-	errCheck := db.QueryRow("SELECT id FROM document_history WHERE document_name = ?", pdfHeader.Filename).Scan(&existing)
-	if errCheck == nil {
-		http.Error(w, "Gagal: Dokumen dengan nama ini sudah pernah ditandatangani. Harap ubah nama file Anda (misal: dokumen_v2.pdf).", http.StatusConflict)
-		return
-	}
-
 	os.MkdirAll("uploads", os.ModePerm)
 	uniqueFileName := fmt.Sprintf("%d_%s", time.Now().Unix(), pdfHeader.Filename)
 	finalPdfPath := filepath.Join("uploads", uniqueFileName)
 
-	// Buat ID unik untuk penamaan file sementara (temp file)
 	tempID := time.Now().UnixNano()
-
-	// Simpan PDF asli sebagai file kerja pertama
 	currentPdfPath := filepath.Join("uploads", fmt.Sprintf("temp_base_%d.pdf", tempID))
 	tempPdf, _ := os.Create(currentPdfPath)
 	io.Copy(tempPdf, pdfFile)
 	tempPdf.Close()
-	defer os.Remove(currentPdfPath) // Akan otomatis dihapus saat fungsi selesai
+	defer os.Remove(currentPdfPath)
 
-	// --- 1. PROSES INJEKSI GAMBAR (OPSIONAL) ---
 	imgFile, _, errImg := r.FormFile("signatureImage")
 	if errImg == nil {
 		defer imgFile.Close()
@@ -227,40 +242,43 @@ func webSignHandler(w http.ResponseWriter, r *http.Request) {
 		tempImg.Close()
 		defer os.Remove(tempImgPath)
 
-		// Koordinat Gambar (Y = 135) diletakkan agak ke atas agar ada ruang untuk teks
-		wmImg, errWmImg := api.ImageWatermark(tempImgPath, "pos:br, scale:0.35, offset:-100 135, rot:0", true, false, types.POINTS)
+		// POSISI DAN KOORDINAT SEKARANG BERSIFAT DINAMIS
+		// Menggunakan kombinasi xCoord dan yCoord dari parameter Frontend
+		imgConfig := fmt.Sprintf("pos:bl, scale:0.35, offset:%s %s, rot:0", xCoord, yCoord)
+		wmImg, errWmImg := api.ImageWatermark(tempImgPath, imgConfig, true, false, types.POINTS)
 
 		if errWmImg == nil {
 			nextPdfPath := filepath.Join("uploads", fmt.Sprintf("temp_withimg_%d.pdf", tempID))
-			err = api.AddWatermarksFile(currentPdfPath, nextPdfPath, []string{"1"}, wmImg, nil)
+			// Menggunakan targetPage secara dinamis, bukan cuma halaman "1" lagi
+			err = api.AddWatermarksFile(currentPdfPath, nextPdfPath, []string{targetPage}, wmImg, nil)
 			if err == nil {
-				// Pindahkan file kerja ke PDF yang sudah berisi gambar
 				currentPdfPath = nextPdfPath
 				defer os.Remove(currentPdfPath)
 			}
 		}
 	}
 
-	// --- 2. PROSES INJEKSI NAMA PENANDATANGAN (TEKS) ---
-	// Koordinat Teks (Y = 90) diletakkan di bawah gambar (Y = 135)
-	textConfig := "font:Helvetica, points:12, pos:br, offset:-100 90, rot:0"
+	// Cetak Teks nama penandatangan tepat di bawah koordinat gambar tanda tangan
+	// Mengurangi nilai Y agar posisi teks berada sedikit di bawah gambar
+	var yText int
+	fmt.Sscanf(yCoord, "%d", &yText)
+	textConfig := fmt.Sprintf("font:Helvetica, points:12, pos:bl, offset:%s %d, rot:0", xCoord, yText-35)
 	wmText, errWmText := api.TextWatermark(signerName, textConfig, true, false, types.POINTS)
 
 	if errWmText == nil {
-		// Suntikkan teks ke file kerja terakhir dan simpan sebagai Hasil Final
-		err = api.AddWatermarksFile(currentPdfPath, finalPdfPath, []string{"1"}, wmText, nil)
+		err = api.AddWatermarksFile(currentPdfPath, finalPdfPath, []string{targetPage}, wmText, nil)
 		if err != nil {
-			os.Rename(currentPdfPath, finalPdfPath) // Fallback jika teks gagal diinjeksi
+			os.Rename(currentPdfPath, finalPdfPath) // Fallback ke file sebelumnya (tanpa teks)
 		}
 	} else {
-		os.Rename(currentPdfPath, finalPdfPath)
+		os.Rename(currentPdfPath, finalPdfPath) // Fallback ke file sebelumnya (tanpa teks)
 	}
 
-	// 3. Simpan Riwayat ke Database
-	_, err = db.Exec("INSERT INTO document_history (email, document_name, signer_name, file_path) VALUES (?, ?, ?, ?)",
-		email, pdfHeader.Filename, signerName, finalPdfPath)
+	os.Rename(currentPdfPath, finalPdfPath)
 
-	fmt.Fprintf(w, "Dokumen atas nama %s berhasil ditandatangani!", signerName)
+	db.Exec("INSERT INTO document_history (email, document_name, signer_name, file_path) VALUES (?, ?, ?, ?)",
+		email, pdfHeader.Filename, signerName, finalPdfPath)
+	fmt.Fprintf(w, "Dokumen berhasil ditandatangani di halaman %s!", targetPage)
 }
 
 // 8. Ambil Riwayat Dokumen
@@ -302,6 +320,7 @@ func downloadDocumentHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // 10. Verifikasi Keaslian Dokumen (Dengan Cek Detail Duplikat)
+// 10. Verifikasi Keaslian Dokumen (Mendukung File Hasil Unduhan "Signed_")
 func verifyDocumentHandler(w http.ResponseWriter, r *http.Request) {
 	err := r.ParseMultipartForm(10 << 20)
 	if err != nil {
@@ -316,15 +335,26 @@ func verifyDocumentHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer pdfFile.Close()
 
-	// 1. Ambil SEMUA data riwayat berdasarkan nama file, URUTKAN dari yang paling awal (ASC)
-	rows, err := db.Query("SELECT signer_name, signed_at FROM document_history WHERE document_name = ? ORDER BY signed_at ASC", pdfHeader.Filename)
+	// --- LOGIKA BARU: PEMBERSIHAN NAMA FILE HASIL UNDUHAN ---
+	filename := pdfHeader.Filename
+
+	// 1. Hapus prefix "Signed_" dari hasil unduhan
+	filename = strings.TrimPrefix(filename, "Signed_")
+
+	// 2. Hapus angka duplikasi dari browser seperti " (1)", " (7)", dsb.
+	// Ini akan mengubah "nama file (7).pdf" kembali menjadi "nama file.pdf"
+	re := regexp.MustCompile(` \(\d+\)\.pdf$`)
+	filename = re.ReplaceAllString(filename, ".pdf")
+	// ----------------------------------------------------------------------
+
+	// Ambil SEMUA data riwayat berdasarkan nama file asli yang sudah dibersihkan total
+	rows, err := db.Query("SELECT signer_name, signed_at FROM document_history WHERE document_name = ? ORDER BY signed_at ASC", filename)
 	if err != nil {
 		http.Error(w, "Terjadi kesalahan database", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
 
-	// Struct sementara untuk menyimpan nama dan waktu
 	type SignerInfo struct {
 		Name string
 		Date string
@@ -337,34 +367,24 @@ func verifyDocumentHandler(w http.ResponseWriter, r *http.Request) {
 		signers = append(signers, SignerInfo{Name: sName, Date: sDate})
 	}
 
-	// 2. Jika tidak ada di database sama sekali
 	if len(signers) == 0 {
 		http.Error(w, "Tanda tangan digital tidak ditemukan atau tidak valid pada sistem kami.", http.StatusNotFound)
 		return
 	}
 
-	// 3. Jika dokumen ditemukan lebih dari 1 kali (Terduplikasi)
 	if len(signers) > 1 {
-		// Index 0 adalah orang pertama (Asli)
 		originalSigner := signers[0].Name
-
-		// Kumpulkan sisa nama yang melakukan duplikasi
 		var duplicators []string
 		for i := 1; i < len(signers); i++ {
 			duplicators = append(duplicators, signers[i].Name)
 		}
-
-		// Gabungkan nama-nama penduplikat menggunakan koma
 		duplicatorNames := strings.Join(duplicators, ", ")
-
-		// Susun pesan Alert (menggunakan \n untuk enter/baris baru di alert browser)
 		errMsg := fmt.Sprintf("PERINGATAN: Dokumen Terduplikasi!\n\n✅ Dokumen asli pertama kali ditandatangani oleh:\n- %s\n\n⚠️ Dokumen ini kemudian diduplikasi/ditandatangani ulang oleh:\n- %s", originalSigner, duplicatorNames)
 
 		http.Error(w, errMsg, http.StatusConflict)
 		return
 	}
 
-	// 4. Jika datanya valid dan tepat hanya ada 1 (Tidak duplikat)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":  "VALID",
@@ -372,6 +392,51 @@ func verifyDocumentHandler(w http.ResponseWriter, r *http.Request) {
 		"date":    signers[0].Date,
 		"message": "Dokumen ini valid dan memiliki tanda tangan digital yang sah.",
 	})
+}
+
+// 11. Pengguna mengajukan pembuatan Digital ID (.p12)
+func requestDigitalIDLifecycleHandler(w http.ResponseWriter, r *http.Request) {
+	var payload RequestIDPayload
+	json.NewDecoder(r.Body).Decode(&payload)
+
+	// Ambil role pengguna dari database
+	var userRole string
+	db.QueryRow("SELECT role FROM users WHERE email = ?", payload.Email).Scan(&userRole)
+
+	expiredDate := time.Now().AddDate(2, 0, 0) // Berlaku 2 Tahun
+
+	_, err := db.Exec(`INSERT INTO digital_id_requests 
+		(email, owner_name, role, expired_date, is_approve, is_ready, is_sent, is_revoke) 
+		VALUES (?, ?, ?, ?, FALSE, FALSE, FALSE, FALSE)`,
+		payload.Email, payload.Name, userRole, expiredDate)
+
+	if err != nil {
+		http.Error(w, "Gagal mengirimkan pengajuan", http.StatusInternalServerError)
+		return
+	}
+	fmt.Fprintf(w, "Pengajuan Digital ID berhasil dikirim ke Admin.")
+}
+
+// 12. Kendali Admin untuk mengubah flag (isApprove, isReady, isSent, isRevoke)
+func adminUpdateLifecycleHandler(w http.ResponseWriter, r *http.Request) {
+	var payload UpdateStatusPayload
+	json.NewDecoder(r.Body).Decode(&payload)
+
+	// Validasi kolom keamanan agar menghindari SQL Injection dinamis
+	allowedFields := map[string]bool{"is_approve": true, "is_ready": true, "is_sent": true, "is_revoke": true}
+	if !allowedFields[payload.Field] {
+		http.Error(w, "Field tidak valid", http.StatusBadRequest)
+		return
+	}
+
+	query := fmt.Sprintf("UPDATE digital_id_requests SET %s = ? WHERE id = ?", payload.Field)
+	_, err := db.Exec(query, payload.Value, payload.RequestID)
+	if err != nil {
+		http.Error(w, "Gagal memperbarui status", http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Fprintf(w, "Status %s berhasil diubah menjadi %v", payload.Field, payload.Value)
 }
 
 func main() {
@@ -387,6 +452,8 @@ func main() {
 	mux.HandleFunc("/history", historyHandler)
 	mux.HandleFunc("/download", downloadDocumentHandler)
 	mux.HandleFunc("/verify-pdf", verifyDocumentHandler)
+	mux.HandleFunc("/request-id-lifecycle", requestDigitalIDLifecycleHandler)
+	mux.HandleFunc("/admin/update-status", adminUpdateLifecycleHandler)
 
 	c := cors.New(cors.Options{
 		AllowedOrigins: []string{"*"}, AllowedMethods: []string{"GET", "POST"}, AllowedHeaders: []string{"Content-Type"},
