@@ -1411,6 +1411,32 @@ func viewDocumentHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, filePath)
 }
 
+func getUserStatusHandler(w http.ResponseWriter, r *http.Request) {
+	// Set header CORS dan JSON
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+
+	email := r.URL.Query().Get("email")
+	if email == "" {
+		http.Error(w, "Email tidak diberikan", http.StatusBadRequest)
+		return
+	}
+
+	var hasP12 bool
+	// Ambil status has_p12 dari tabel users berdasarkan email
+	err := db.QueryRow("SELECT has_p12 FROM users WHERE email = ?", email).Scan(&hasP12)
+	if err != nil {
+		fmt.Println("[ERROR DB] Gagal mengambil status user:", err)
+		http.Error(w, "Gagal mengambil status pengguna", http.StatusInternalServerError)
+		return
+	}
+
+	// Kirim balik statusnya ke React
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"has_p12": hasP12,
+	})
+}
+
 func main() {
 	initDB()
 	mux := http.NewServeMux()
@@ -1439,11 +1465,17 @@ func main() {
 	mux.HandleFunc("/dosen/list", getDosenListHandler)
 	mux.HandleFunc("/get-file", getFileHandler)
 	mux.HandleFunc("/view/", viewDocumentHandler)
+	mux.HandleFunc("/user/status", getUserStatusHandler)
 
 	c := cors.New(cors.Options{
-		AllowedOrigins: []string{"http://localhost:3000", "https://dgsign.test:3000"}, // Tambahkan origin HTTPS
-		AllowedMethods: []string{"GET", "POST", "OPTIONS"},
-		AllowedHeaders: []string{"Content-Type"},
+		AllowedOrigins: []string{
+			"http://localhost:3000",
+			"https://localhost:3000", // <-- INI YANG KURANG!
+			"http://dgsign.test:3000",
+			"https://dgsign.test:3000",
+		},
+		AllowedMethods: []string{"GET", "POST", "OPTIONS", "PUT", "DELETE"},
+		AllowedHeaders: []string{"Content-Type", "Authorization"}, // <-- 'Authorization' WAJIB ADA
 	})
 	fmt.Println("Backend HTTPS berjalan di port 8081...")
 

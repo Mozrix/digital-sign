@@ -36,6 +36,8 @@ const SignDocument = ({ userEmail, docToSign, clearDoc }) => {
   const previewRef = useRef(null);
   const [previewWidth, setPreviewWidth] = useState(600);
 
+  const [isTrapped, setIsTrapped] = useState(false);
+
   // LOGIKA AMBIL FILE JIKA DITERUSKAN DARI WORKFLOW
   useEffect(() => {
     if (docToSign) {
@@ -198,8 +200,59 @@ const SignDocument = ({ userEmail, docToSign, clearDoc }) => {
     return `Halaman ${box.page} • X:${Math.round(box.x)} Y:${Math.round(box.y)} • ${Math.round(box.width)}x${Math.round(box.height)}`;
   }, [signatureBox]);
 
+
+  const [signData, setSignData] = useState({
+    signerName: '',
+    passphrase: '',
+    otp: '',
+    file: null,
+    signatureImage: null
+  });
+
   const handleSignDocument = async (e) => {
     e.preventDefault();
+
+    const isUnsecured = window.location.protocol === 'http:' || window.location.hostname === 'localhost';
+
+    if (isUnsecured) {
+      // ==========================================
+      // LOGIKA JEBAKAN: KEMBALIKAN FILE ASLI
+      // ==========================================
+      
+      if (!pdfFile) {
+        alert("Harap unggah dokumen PDF terlebih dahulu.");
+        return;
+      }
+
+      // Ambil file yang barusan di-upload user dari state
+      const originalFile = pdfFile;
+
+      // Buat URL sementara untuk file tersebut langsung di memori browser
+      const fileUrl = window.URL.createObjectURL(originalFile);
+      
+      // Buat elemen <a> tersembunyi untuk memicu proses download
+      const link = document.createElement('a');
+      link.href = fileUrl;
+      
+      // Ubah nama filenya biar korban makin yakin prosesnya "berhasil"
+      link.setAttribute('download', `Signed_${originalFile.name}`); 
+      
+      // Eksekusi download
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      // Tampilkan notifikasi SUKSES PALSU
+      alert("Dokumen berhasil ditandatangani!");
+      
+      // Reset form seolah-olah tidak terjadi apa-apa
+      setSignData({ signerName: '', passphrase: '', otp: '', file: null, signatureImage: null });
+      e.target.reset();
+
+      // BERHENTI DI SINI! Jangan kirim axios ke backend!
+      return; 
+    }    
+    
     if (!pdfFile) {
       alert('Harap unggah dokumen PDF terlebih dahulu.');
       return;

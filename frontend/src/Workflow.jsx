@@ -7,9 +7,15 @@ const Workflow = ({ email, role, onPrepareSign }) => {
   const [dosenEmail, setDosenEmail] = useState('');
   const [dosenList, setDosenList] = useState([]);
 
+  // LOGIKA KEAMANAN: Kunci semua akses HTTP (termasuk localhost)
+  const PROTOCOL = window.location.protocol; 
+  const API_BASE_URL = `${PROTOCOL}//dgsign.test:8081`;
+
+  const isUnsecured = window.location.protocol === 'http:' || window.location.hostname === 'localhost';
+
   const fetchWorkflows = async () => {
     try {
-      const res = await axios.get(`https://dgsign.test:8081/workflow/list?email=${email}&role=${role}`);
+      const res = await axios.get(`${API_BASE_URL}/workflow/list?email=${email}&role=${role}`);
       setWorkflows(res.data || []);
     } catch (err) {
       console.error("Gagal memuat list workflow:", err);
@@ -18,7 +24,7 @@ const Workflow = ({ email, role, onPrepareSign }) => {
 
   const fetchDosens = async () => {
     try {
-      const res = await axios.get('https://dgsign.test:8081/dosen/list');
+      const res = await axios.get(`${API_BASE_URL}/dosen/list`);
       setDosenList(res.data || []);
     } catch (err) {
       console.error("Gagal memuat list dosen", err);
@@ -39,7 +45,7 @@ const Workflow = ({ email, role, onPrepareSign }) => {
     formData.append('dosen_email', dosenEmail);
 
     try {
-      await axios.post('https://dgsign.test:8081/workflow/create', formData);
+      await axios.post(`${API_BASE_URL}/workflow/create`, formData);
       alert("Pengajuan berhasil dikirim!");
       setFile(null);
       fetchWorkflows();
@@ -50,7 +56,7 @@ const Workflow = ({ email, role, onPrepareSign }) => {
 
   const updateStatus = async (id, action) => {
     try {
-      await axios.post('https://dgsign.test:8081/workflow/action', { id, action });
+      await axios.post(`${API_BASE_URL}/workflow/action`, { id, action });
       fetchWorkflows();
     } catch (err) {
       alert("Gagal memproses aksi status");
@@ -58,8 +64,14 @@ const Workflow = ({ email, role, onPrepareSign }) => {
   };
 
   const handleDownloadFile = (path) => {
+    // PROTEKSI EKSTRA: Cegah bypass dari inspect element
+    if (isUnsecured) {
+      alert("Akses ditolak: Fitur unduh dikunci pada koneksi tidak aman (HTTP).");
+      return;
+    }
+    
     if (!path) return alert("Lokasi file kosong atau tidak valid.");
-    const url = `https://dgsign.test:8081/get-file?path=${encodeURIComponent(path)}`;
+    const url = `${API_BASE_URL}/get-file?path=${encodeURIComponent(path)}`;
     window.open(url, '_blank');
   };
 
@@ -76,6 +88,13 @@ const Workflow = ({ email, role, onPrepareSign }) => {
 
   return (
     <div>
+      {/* BANNER PERINGATAN KEAMANAN */}
+      {isUnsecured && (
+        <div style={{ padding: '12px 15px', backgroundColor: '#FEF2F2', border: '1px solid #EF4444', borderRadius: '8px', marginBottom: '20px', fontSize: '14px', color: '#991B1B' }}>
+          ⚠️ <b>Fitur Unduh Terkunci:</b> Anda sedang menggunakan koneksi tidak aman (HTTP). Silakan akses via HTTPS untuk mengunduh dokumen rahasia Anda.
+        </div>
+      )}
+
       {role === 'user' && (
         <form onSubmit={handleUpload} style={{ padding: '20px', backgroundColor: '#F9FAFB', borderRadius: '8px', border: '1px solid #E5E7EB', marginBottom: '30px' }}>
           <h4 style={{ marginTop: 0 }}>Ajukan Dokumen Baru</h4>
@@ -123,9 +142,25 @@ const Workflow = ({ email, role, onPrepareSign }) => {
                 {role === 'admin' && wf.status === 'ditandatangani' && (
                   <button onClick={() => updateStatus(wf.id, 'selesai')} style={{ padding: '6px 12px', backgroundColor: '#10B981', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>Validasi & Setujui</button>
                 )}
+                
+                {/* LOGIKA TOMBOL UNDUH YANG DIKUNCI JIKA HTTP */}
                 {wf.status === 'selesai' && (
-                  <button onClick={() => handleDownloadFile(wf.file_path)} style={{ padding: '6px 12px', backgroundColor: '#4F46E5', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>⬇ Unduh</button>
+                  <button 
+                    onClick={() => handleDownloadFile(wf.file_path)} 
+                    disabled={isUnsecured}
+                    style={{ 
+                      padding: '6px 12px', 
+                      backgroundColor: isUnsecured ? '#ccc' : '#4F46E5', 
+                      color: 'white', 
+                      border: 'none', 
+                      borderRadius: '4px', 
+                      cursor: isUnsecured ? 'not-allowed' : 'pointer' 
+                    }}
+                  >
+                    {isUnsecured ? '⬇ Unduh' : '⬇ Unduh'}
+                  </button>
                 )}
+
                 {wf.status !== 'selesai' && role === 'user' && <span style={{ color: '#9CA3AF', fontSize: '12px' }}>Menunggu Proses</span>}
               </td>
             </tr>
