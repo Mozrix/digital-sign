@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"crypto"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -10,24 +12,31 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/png"
 	"io"
 	"log"
 	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/digitorus/pdf"
 	"github.com/digitorus/pdfsign/sign"
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/pdfcpu/pdfcpu/pkg/api"
-	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 	"github.com/pquerna/otp/totp"
 	"github.com/rs/cors"
+	"github.com/skip2/go-qrcode"
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/basicfont"
+	"golang.org/x/image/math/fixed"
 	"software.sslmate.com/src/go-pkcs12"
 )
 
@@ -38,6 +47,19 @@ type AuthPayload struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
 }
+
+type SignerInfo struct {
+	Name            string    `json:"name"`
+	Date            time.Time `json:"date"`
+	IntegrityStatus string    `json:"integrity_status"`
+}
+
+type VerifyResponse struct {
+	Message string       `json:"message"`
+	IsValid bool         `json:"isValid"`
+	Signers []SignerInfo `json:"signers"`
+}
+
 type BasicPayload struct {
 	Email string `json:"email"`
 }
@@ -58,6 +80,7 @@ type HistoryItem struct {
 	SignerName   string `json:"signer_name"`
 	SignedAt     string `json:"signed_at"`
 	Status       string `json:"status"`
+	FileToken    string `json:"file_token"`
 }
 
 type UpdateStatusPayload struct {
@@ -73,13 +96,120 @@ type ApprovePayload struct {
 
 func initDB() {
 	var err error
-	db, err = sql.Open("mysql", "root:@tcp(127.0.0.1:3306)/dgsign_db")
+	db, err = sql.Open("mysql", "root:@tcp(127.0.0.1:3306)/dgsign_db?parseTime=true")
 	if err != nil {
 		log.Fatal(err)
 	}
 	if err = db.Ping(); err != nil {
 		log.Fatal("Gagal terhubung ke MySQL:", err)
 	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS users (
+			id INT AUTO_INCREMENT PRIMARY KEY,
+			email VARCHAR(255) UNIQUE NOT NULL,
+			password VARCHAR(255) NOT NULL,
+			name VARCHAR(255),
+			otp_secret VARCHAR(100),
+			role VARCHAR(20) DEFAULT 'user',
+			has_p12 BOOLEAN DEFAULT FALSE,
+			p12_path VARCHAR(500),
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	if err != nil {
+		log.Println("Gagal membuat tabel users:", err)
+	}
+
+	for _, stmt := range []string{
+		"ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(255)",
+		"ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_secret VARCHAR(100)",
+		"ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'user'",
+		"ALTER TABLE users ADD COLUMN IF NOT EXISTS has_p12 BOOLEAN DEFAULT FALSE",
+		"ALTER TABLE users ADD COLUMN IF NOT EXISTS p12_path VARCHAR(500)",
+		"ALTER TABLE signed_documents ADD COLUMN IF NOT EXISTS scan_count INT DEFAULT 0",
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			log.Printf("Gagal memastikan skema users (%s): %v", stmt, err)
+		}
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS document_history (
+			id INT AUTO_INCREMENT PRIMARY KEY,
+			email VARCHAR(255) NOT NULL,
+			document_name VARCHAR(255) NOT NULL,
+			signer_name VARCHAR(255) NOT NULL,
+			file_path VARCHAR(500) NOT NULL,
+			signed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			status VARCHAR(20) DEFAULT 'menunggu',
+			file_token VARCHAR(255)
+		)
+	`)
+	if err != nil {
+		log.Println("Gagal membuat tabel document_history:", err)
+	}
+
+	for _, stmt := range []string{
+		"ALTER TABLE document_history ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'menunggu'",
+		"ALTER TABLE document_history ADD COLUMN IF NOT EXISTS file_token VARCHAR(255)",
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			log.Printf("Gagal memastikan skema document_history (%s): %v", stmt, err)
+		}
+	}
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS signed_documents (
+			id BIGINT AUTO_INCREMENT PRIMARY KEY,
+			uuid VARCHAR(128) NOT NULL UNIQUE,
+			user_id BIGINT NOT NULL,
+			filename VARCHAR(255) NOT NULL,
+			file_path VARCHAR(500) NOT NULL,
+			hash_sha256 VARCHAR(64) NOT NULL,
+			certificate_serial VARCHAR(128),
+			signer_name VARCHAR(255),
+			signer_email VARCHAR(255),
+			issuer_name VARCHAR(255),
+			valid_until DATETIME,
+			signed_at DATETIME NOT NULL,
+			verification_token VARCHAR(128),
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		)
+	`)
+	if err != nil {
+		log.Println("Gagal membuat tabel signed_documents:", err)
+	}
+
+	for _, stmt := range []string{
+		"ALTER TABLE signed_documents ADD COLUMN IF NOT EXISTS signer_name VARCHAR(255)",
+		"ALTER TABLE signed_documents ADD COLUMN IF NOT EXISTS issuer_name VARCHAR(255)",
+		"ALTER TABLE signed_documents ADD COLUMN IF NOT EXISTS valid_until DATETIME",
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			log.Printf("Gagal memastikan skema signed_documents (%s): %v", stmt, err)
+		}
+	}
+
+	// --- TAMBAHAN UNTUK FITUR ALUR PENGAJUAN (WORKFLOW) ---
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS document_workflows (
+			id INT AUTO_INCREMENT PRIMARY KEY,
+			mahasiswa_email VARCHAR(255) NOT NULL,
+			dosen_email VARCHAR(255) NOT NULL,
+			document_name VARCHAR(255) NOT NULL,
+			original_file_path VARCHAR(500) NOT NULL,
+			signed_file_path VARCHAR(500),
+			status VARCHAR(50) DEFAULT 'menunggu_dosen', -- menunggu_dosen, diterima_dosen, ditandatangani, selesai
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	if err != nil {
+		log.Println("Gagal membuat tabel document_workflows:", err)
+	}
+	// ------------------------------------------------------
+
 	fmt.Println("Koneksi MySQL Berhasil!")
 }
 
@@ -88,10 +218,115 @@ func hashPassword(password string) string {
 	return hex.EncodeToString(hash[:])
 }
 
+func sanitizeString(value string) string {
+	return strings.TrimSpace(value)
+}
+
+func normalizeEmail(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func drawTextOnImage(img *image.RGBA, x, y int, label string, col color.Color) {
+	point := fixed.Point26_6{X: fixed.I(x), Y: fixed.I(y)}
+	drawer := &font.Drawer{
+		Dst:  img,
+		Src:  image.NewUniform(col),
+		Face: basicfont.Face7x13,
+		Dot:  point,
+	}
+	drawer.DrawString(label)
+}
+
+func displayNameFromCertificate(cert *x509.Certificate, fallback string) string {
+	if cert != nil && cert.Subject.CommonName != "" {
+		return cert.Subject.CommonName
+	}
+	if cert != nil && len(cert.Subject.Organization) > 0 {
+		return cert.Subject.Organization[0]
+	}
+	return fallback
+}
+
+func issuerNameFromCertificate(cert *x509.Certificate) string {
+	if cert == nil {
+		return "DGSign Certificate"
+	}
+	if cert.Issuer.CommonName != "" {
+		return cert.Issuer.CommonName
+	}
+	if len(cert.Issuer.Organization) > 0 {
+		return cert.Issuer.Organization[0]
+	}
+	return "DGSign Certificate"
+}
+
+func createVisualSignatureImage(textLines []string, qrURL string, width int, height int) (string, error) {
+	if width <= 0 {
+		width = 280
+	}
+	if height <= 0 {
+		height = 140
+	}
+
+	dst := image.NewRGBA(image.Rect(0, 0, width, height))
+	draw.Draw(dst, dst.Bounds(), &image.Uniform{color.RGBA{255, 255, 255, 255}}, image.Point{}, draw.Src)
+
+	qrSize := 90
+	if width < 220 || height < 100 {
+		qrSize = 60
+	}
+
+	// QR code (fallback to text-only block if QR generation fails)
+	qrBounds := image.Rectangle{}
+	if qr, err := qrcode.New(qrURL, qrcode.Medium); err == nil {
+		qrImage := qr.Image(qrSize)
+		qrBounds = qrImage.Bounds()
+		qrX := 10
+		qrY := (height - qrBounds.Dy()) / 2
+
+		// [FIXED] Use draw.Draw instead of manually setting pixels
+		qrRect := image.Rect(qrX, qrY, qrX+qrBounds.Dx(), qrY+qrBounds.Dy())
+		draw.Draw(dst, qrRect, qrImage, image.Point{0, 0}, draw.Over)
+
+	} else {
+		log.Printf("QR generation failed for %s: %v", qrURL, err)
+	}
+
+	// Text panel
+	x := 0
+	if qrBounds.Dx() > 0 {
+		x = qrBounds.Dx() + 24
+	} else {
+		x = 12
+	}
+	for i, line := range textLines {
+		yPos := 22 + (i * 16)
+		drawTextOnImage(dst, x, yPos, line, color.Black)
+	}
+
+	if err := os.MkdirAll("uploads", os.ModePerm); err != nil {
+		return "", err
+	}
+	outPath := filepath.Join("uploads", fmt.Sprintf("visual_%d.png", time.Now().UnixNano()))
+	file, err := os.Create(outPath)
+	if err != nil {
+		return "", err
+	}
+	if err := png.Encode(file, dst); err != nil {
+		file.Close()
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	return outPath, nil
+}
+
 // 1. Register
 func registerHandler(w http.ResponseWriter, r *http.Request) {
 	var payload AuthPayload
 	json.NewDecoder(r.Body).Decode(&payload)
+	payload.Email = normalizeEmail(payload.Email)
 	hashedPassword := hashPassword(payload.Password)
 	_, err := db.Exec("INSERT INTO users (email, password) VALUES (?, ?)", payload.Email, hashedPassword)
 	if err != nil {
@@ -105,12 +340,16 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	var payload AuthPayload
 	json.NewDecoder(r.Body).Decode(&payload)
+	payload.Email = normalizeEmail(payload.Email)
 
 	hashedPassword := hashPassword(payload.Password)
 	var otpSecret sql.NullString
-	var role sql.NullString // PENGAMAN: Mencegah error jika data di database NULL
+	var role sql.NullString
 
-	err := db.QueryRow("SELECT otp_secret, role FROM users WHERE email = ? AND password = ?", payload.Email, hashedPassword).Scan(&otpSecret, &role)
+	// 1. UBAH TIPE DATA MENJADI INT (Untuk mengakomodasi TINYINT MySQL)
+	var hasP12Int sql.NullInt64
+
+	err := db.QueryRow("SELECT otp_secret, role, has_p12 FROM users WHERE email = ? AND password = ?", payload.Email, hashedPassword).Scan(&otpSecret, &role, &hasP12Int)
 	if err != nil {
 		http.Error(w, "Email atau password salah", http.StatusUnauthorized)
 		return
@@ -118,17 +357,24 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 
 	requireSetup := !otpSecret.Valid || otpSecret.String == ""
 
-	// Jika role valid, gunakan isinya. Jika tidak, default ke 'user'
 	userRole := "user"
 	if role.Valid && role.String != "" {
 		userRole = role.String
+	}
+
+	// 2. TERJEMAHKAN ANGKA 1 MENJADI TRUE, 0/NULL MENJADI FALSE
+	isHasP12 := false
+	if hasP12Int.Valid && hasP12Int.Int64 == 1 {
+		isHasP12 = true
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"message":      "Kredensial valid",
 		"requireSetup": requireSetup,
-		"role":         userRole, // Kirim role yang sudah pasti valid ke React
+		"role":         userRole,
+		// 3. KIRIM NILAI BOOLEAN YANG SUDAH MATANG KE REACT
+		"has_p12": isHasP12,
 	})
 }
 
@@ -136,6 +382,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 func verifyOTPHandler(w http.ResponseWriter, r *http.Request) {
 	var payload OTPVerifyPayload
 	json.NewDecoder(r.Body).Decode(&payload)
+	payload.Email = normalizeEmail(payload.Email)
 
 	var secret sql.NullString
 	err := db.QueryRow("SELECT otp_secret FROM users WHERE email = ?", payload.Email).Scan(&secret)
@@ -156,6 +403,7 @@ func verifyOTPHandler(w http.ResponseWriter, r *http.Request) {
 func generateOTPHandler(w http.ResponseWriter, r *http.Request) {
 	var payload BasicPayload
 	json.NewDecoder(r.Body).Decode(&payload)
+	payload.Email = normalizeEmail(payload.Email)
 
 	key, _ := totp.Generate(totp.GenerateOpts{Issuer: "Sistem-DGSign", AccountName: payload.Email})
 	db.Exec("UPDATE users SET otp_secret = ? WHERE email = ?", key.Secret(), payload.Email)
@@ -168,6 +416,7 @@ func generateOTPHandler(w http.ResponseWriter, r *http.Request) {
 func resetOTPHandler(w http.ResponseWriter, r *http.Request) {
 	var payload BasicPayload
 	json.NewDecoder(r.Body).Decode(&payload)
+	payload.Email = normalizeEmail(payload.Email)
 	db.Exec("UPDATE users SET otp_secret = NULL WHERE email = ?", payload.Email)
 	fmt.Fprintf(w, "OTP direset.")
 }
@@ -183,21 +432,31 @@ func requestDigitalIDHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Data tidak valid", http.StatusBadRequest)
 		return
 	}
+	payload.Email = normalizeEmail(payload.Email)
 
-	// 1. Buat Kunci Privat RSA-2048
+	// =================================================================
+	// 1. CEK DULU DI DB: APAKAH DIA SUDAH PUNYA .P12?
+	// =================================================================
+	var hasP12 bool
+	errCheck := db.QueryRow("SELECT has_p12 FROM users WHERE email = ?", payload.Email).Scan(&hasP12)
+	if errCheck == nil && hasP12 {
+		http.Error(w, "Anda sudah memiliki Digital ID aktif. Sistem hanya mengizinkan 1 identitas per akun.", http.StatusForbidden)
+		return
+	}
+	// =================================================================
+
+	// 2. Buat Kunci Privat RSA-2048
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		http.Error(w, "Gagal membuat kunci privat", http.StatusInternalServerError)
 		return
 	}
 
-	// 2. Buat Nomor Seri Unik
+	// 3. Buat Nomor Seri Unik
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, _ := rand.Int(rand.Reader, serialNumberLimit)
 
-	// =================================================================
-	// 3. ROMBAK TOTAL: TEMPLATE SERTIFIKAT STANDAR ADOBE (ROOT CA)
-	// =================================================================
+	// 4. TEMPLATE SERTIFIKAT END-ENTITY UNTUK PDF SIGNING
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
@@ -209,67 +468,178 @@ func requestDigitalIDHandler(w http.ResponseWriter, r *http.Request) {
 		NotBefore: time.Now(),
 		NotAfter:  time.Now().AddDate(2, 0, 0), // Valid 2 Tahun
 
-		// KUNCI UTAMA AGAR ADOBE TERIMA:
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageEmailProtection, x509.ExtKeyUsageTimeStamping},
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageContentCommitment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning, x509.ExtKeyUsageEmailProtection},
 		BasicConstraintsValid: true,
-		IsCA:                  true, // Adobe JAUH lebih percaya jika sertifikat bertindak sebagai CA
+		IsCA:                  false,
 	}
 
-	// 4. Cetak Sertifikat Mentah (DER Bytes)
+	// 5. Cetak Sertifikat Mentah (DER Bytes)
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
 	if err != nil {
 		http.Error(w, "Gagal mencetak sertifikat x509", http.StatusInternalServerError)
 		return
 	}
 
-	// --- TAMBAHAN BARU: Parsing derBytes menjadi objek *x509.Certificate ---
+	// 6. Parsing derBytes menjadi objek *x509.Certificate
 	cert, errParse := x509.ParseCertificate(derBytes)
 	if errParse != nil {
 		http.Error(w, "Gagal membaca struktur sertifikat", http.StatusInternalServerError)
 		return
 	}
-	// ------------------------------------------------------------------------
 
-	// 5. Bungkus menjadi .p12 menggunakan variabel 'cert' (bukan 'derBytes')
+	// 7. Bungkus menjadi .p12
 	pfxBytes, err := pkcs12.Encode(rand.Reader, privateKey, cert, nil, payload.Passphrase)
 	if err != nil {
 		http.Error(w, "Gagal membungkus ke PKCS12", http.StatusInternalServerError)
 		return
 	}
-	// 6. Kirim ke React
+
+	// Buat nama file aman berbasis hash email agar tidak mudah ditebak
+	hashEmail := md5.Sum([]byte(payload.Email))
+	safeFileName := fmt.Sprintf("%x.p12", hashEmail)
+	keystorePath := filepath.Join("keystore", safeFileName)
+
+	if err := os.MkdirAll("keystore", os.ModePerm); err != nil {
+		http.Error(w, "Gagal menyiapkan folder penyimpanan sertifikat", http.StatusInternalServerError)
+		return
+	}
+
+	// Tulis byte ke file lokal server
+	errWrite := os.WriteFile(keystorePath, pfxBytes, 0600) // Akses strict (0600)
+	if errWrite != nil {
+		http.Error(w, "Gagal menyimpan sertifikat di brankas server", http.StatusInternalServerError)
+		return
+	}
+
+	// =================================================================
+	// 9. UPDATE DATABASE (HAS_P12 & PATH)
+	// =================================================================
+	_, errUpdate := db.Exec("UPDATE users SET has_p12 = TRUE, p12_path = ? WHERE email = ?", keystorePath, payload.Email)
+	if errUpdate != nil {
+		http.Error(w, "Gagal menyimpan status Digital ID ke database: "+errUpdate.Error(), http.StatusInternalServerError)
+		return
+	}
+	// =================================================================
+
+	// 9. Kirim file .p12 ke React
 	w.Header().Set("Content-Type", "application/x-pkcs12")
 	w.Write(pfxBytes)
 }
 
-// 7. Web Sign (Dengan Pencegahan Duplikat, Injeksi Gambar, & Injeksi Nama)
-// 7. Web Sign (Dengan Koordinat Dinamis & Halaman Manual)
-// Handler Tanda Tangan Web (Visual + Kriptografi)
-func webSignHandler(w http.ResponseWriter, r *http.Request) {
-	err := r.ParseMultipartForm(10 << 20)
+// =========================================================================
+// FUNGSI BIKIN GAMBAR VISUAL (QR CODE + TEKS) OTOMATIS
+// =========================================================================
+func generateSignatureVisualBytes(textLines []string, qrContent string, width, height int) ([]byte, error) {
+	qrSize := height
+	if qrSize > width/3 {
+		qrSize = width / 3
+	}
+	qrImg, err := qrcode.Encode(qrContent, qrcode.Medium, qrSize)
 	if err != nil {
+		return nil, err
+	}
+	qrImage, _, _ := image.Decode(bytes.NewReader(qrImg))
+
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	draw.Draw(img, img.Bounds(), image.White, image.Point{}, draw.Src)
+
+	offset := image.Pt(10, (height-qrSize)/2)
+	draw.Draw(img, qrImage.Bounds().Add(offset), qrImage, image.Point{}, draw.Over)
+
+	textColor := color.RGBA{0, 0, 0, 255}
+	textX := 10 + qrSize + 15
+	textY := 20
+
+	for _, line := range textLines {
+		d := &font.Drawer{
+			Dst:  img,
+			Src:  image.NewUniform(textColor),
+			Face: basicfont.Face7x13,
+			Dot:  fixed.Point26_6{X: fixed.I(textX), Y: fixed.I(textY)},
+		}
+		d.DrawString(line)
+		textY += 16
+	}
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// =========================================================================
+// HANDLER TANDA TANGAN (webSignHandler) YANG SUDAH JADI
+// =========================================================================
+func webSignHandler(w http.ResponseWriter, r *http.Request) {
+	if r.TLS == nil {
+		http.Error(w, "Koneksi tidak aman! Proses tanda tangan digagalkan karena SSL tidak aktif.", http.StatusForbidden)
+		return
+	}
+
+	if err := r.ParseMultipartForm(50 << 20); err != nil {
 		http.Error(w, "Ukuran file terlalu besar", http.StatusBadRequest)
 		return
 	}
 
-	// 1. Ambil Data Form
-	email := r.FormValue("email")
-	otpCode := r.FormValue("otpCode")
-	signerName := r.FormValue("signerName")
-	passphrase := r.FormValue("passphrase")
-	targetPage := r.FormValue("page")
-	xCoord := r.FormValue("x")
-	yCoord := r.FormValue("y")
+	email := normalizeEmail(r.FormValue("email"))
+	otpCode := sanitizeString(r.FormValue("otpCode"))
+	passphrase := sanitizeString(r.FormValue("passphrase"))
+	signerName := sanitizeString(r.FormValue("signerName")) // Dari React
+	targetPage := sanitizeString(r.FormValue("page"))
+	xCoord := sanitizeString(r.FormValue("x"))
+	yCoord := sanitizeString(r.FormValue("y"))
+	widthCoord := sanitizeString(r.FormValue("width"))
+	heightCoord := sanitizeString(r.FormValue("height"))
+	workflowID := r.FormValue("workflow_id")
 
-	// 2. Validasi OTP
+	userSignatureImageFile, _, err := r.FormFile("signatureImage")
+	var customImageBytes []byte
+	if err == nil {
+		defer userSignatureImageFile.Close()
+		customImageBytes, _ = io.ReadAll(userSignatureImageFile)
+	}
+
+	if email == "" || passphrase == "" || otpCode == "" {
+		http.Error(w, "Email, passphrase, dan OTP wajib diisi", http.StatusBadRequest)
+		return
+	}
+
+	var userRole string
 	var secret sql.NullString
-	db.QueryRow("SELECT otp_secret FROM users WHERE email = ?", email).Scan(&secret)
+	if err := db.QueryRow("SELECT otp_secret, role FROM users WHERE email = ?", email).Scan(&secret, &userRole); err != nil || !secret.Valid || secret.String == "" {
+		http.Error(w, "Akun belum punya pengaturan OTP", http.StatusUnauthorized)
+		return
+	}
+
+	if userRole == "mahasiswa" || userRole == "user" {
+		http.Error(w, "Akses ditolak: Mahasiswa tidak diizinkan.", http.StatusForbidden)
+		return
+	}
 	if !totp.Validate(otpCode, secret.String) {
 		http.Error(w, "OTP Salah atau Kedaluwarsa", http.StatusUnauthorized)
 		return
 	}
 
-	// 3. Persiapan File
+	var p12Path sql.NullString
+	if err := db.QueryRow("SELECT p12_path FROM users WHERE email = ? AND has_p12 = 1", email).Scan(&p12Path); err != nil || !p12Path.Valid {
+		http.Error(w, "Digital ID belum dibuat", http.StatusBadRequest)
+		return
+	}
+
+	p12Bytes, err := os.ReadFile(p12Path.String)
+	if err != nil {
+		http.Error(w, "File sertifikat tidak ditemukan di server", http.StatusInternalServerError)
+		return
+	}
+
+	privateKey, cert, err := pkcs12.Decode(p12Bytes, passphrase)
+	if err != nil {
+		http.Error(w, "Passphrase salah atau sertifikat tidak valid", http.StatusUnauthorized)
+		return
+	}
+
 	pdfFile, pdfHeader, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "Dokumen PDF wajib diunggah", http.StatusBadRequest)
@@ -278,122 +648,187 @@ func webSignHandler(w http.ResponseWriter, r *http.Request) {
 	defer pdfFile.Close()
 
 	os.MkdirAll("uploads", os.ModePerm)
-	uniqueID := time.Now().UnixNano()
-	finalPdfPath := filepath.Join("uploads", fmt.Sprintf("%d_%s", time.Now().Unix(), pdfHeader.Filename))
+	inputPdfPath := filepath.Join("uploads", fmt.Sprintf("%d_%s", time.Now().Unix(), pdfHeader.Filename))
 
-	// Simpan PDF Awal
-	tempPdfPath := filepath.Join("uploads", fmt.Sprintf("temp_base_%d.pdf", uniqueID))
-	tempFile, _ := os.Create(tempPdfPath)
-	io.Copy(tempFile, pdfFile)
-	tempFile.Close()
-	defer os.Remove(tempPdfPath)
-
-	// 4. PROSES GAMBAR (Watermark) - Jika ada
-	currentPdfPath := tempPdfPath
-	imgFile, _, errImg := r.FormFile("signatureImage")
-	if errImg == nil {
-		defer imgFile.Close()
-		tempImgPath := filepath.Join("uploads", fmt.Sprintf("temp_img_%d.png", uniqueID))
-		outImg, _ := os.Create(tempImgPath)
-		io.Copy(outImg, imgFile)
-		outImg.Close()
-		defer os.Remove(tempImgPath)
-
-		// Gunakan nil agar tidak error kompilasi
-		imgConfig := fmt.Sprintf("pos:bl, scale:0.35, offset:%s %s, rot:0", xCoord, yCoord)
-		wm, _ := api.ImageWatermark(tempImgPath, imgConfig, true, false, types.POINTS)
-
-		withImgPath := filepath.Join("uploads", fmt.Sprintf("with_img_%d.pdf", uniqueID))
-		// Gunakan nil untuk konfigurasi untuk menghindari error "undefined"
-		err = api.AddWatermarksFile(currentPdfPath, withImgPath, []string{targetPage}, wm, nil)
-
-		if err == nil {
-			currentPdfPath = withImgPath
-			defer os.Remove(currentPdfPath)
-		}
-	}
-
-	// 5. PROSES KRIPTOGRAFI (Sign)
-	p12FileHeader, _, errP12 := r.FormFile("p12File")
-	if errP12 != nil {
-		http.Error(w, "File .p12 tidak ditemukan", http.StatusBadRequest)
+	inputFile, err := os.Create(inputPdfPath)
+	if err != nil {
+		http.Error(w, "Gagal simpan file", http.StatusInternalServerError)
 		return
 	}
-	defer p12FileHeader.Close()
+	io.Copy(inputFile, pdfFile)
+	inputFile.Close()
 
-	p12Bytes, _ := io.ReadAll(p12FileHeader)
-	privateKey, cert, errDecode := pkcs12.Decode(p12Bytes, passphrase)
-	if errDecode != nil {
-		http.Error(w, "Passphrase P12 salah", http.StatusUnauthorized)
-		return
-	}
-
-	// Buka file yang sudah diproses (base atau with_img)
-	inputPdf, _ := os.Open(currentPdfPath)
+	inputPdf, _ := os.Open(inputPdfPath)
 	defer inputPdf.Close()
-
 	finfo, _ := inputPdf.Stat()
-	size := finfo.Size()
-	pdfReader, _ := pdf.NewReader(inputPdf, size)
+	pdfReader, _ := pdf.NewReader(inputPdf, finfo.Size())
 
-	cryptoPdfPath := filepath.Join("uploads", filepath.Base(finalPdfPath))
-	outputPdf, _ := os.Create(cryptoPdfPath)
-	defer outputPdf.Close()
+	pageNo, _ := strconv.ParseUint(targetPage, 10, 32)
+	if pageNo <= 0 {
+		pageNo = 1
+	}
+	xPos, _ := strconv.ParseFloat(xCoord, 64)
+	yPos, _ := strconv.ParseFloat(yCoord, 64)
+	boxW, _ := strconv.ParseFloat(widthCoord, 64)
+	boxH, _ := strconv.ParseFloat(heightCoord, 64)
 
-	errSign := sign.Sign(inputPdf, outputPdf, pdfReader, size, sign.SignData{
-		Signature: sign.SignDataSignature{
-			CertType:   sign.CertificationSignature,
-			DocMDPPerm: sign.AllowFillingExistingFormFieldsAndSignaturesPerms,
-		},
-		Signer:          privateKey.(crypto.Signer),
-		DigestAlgorithm: crypto.SHA256,
-		Certificate:     cert,
-	})
-
-	if errSign != nil {
-		http.Error(w, "Gagal enkripsi tanda tangan", http.StatusInternalServerError)
-		return
+	if yPos < 0 {
+		yPos = 50
+	}
+	if xPos < 0 {
+		xPos = 50
 	}
 
-	// 6. Simpan File Final
-	os.Rename(cryptoPdfPath, finalPdfPath)
-	db.Exec("INSERT INTO document_history (email, document_name, signer_name, file_path, status) VALUES (?, ?, ?, ?, 'menunggu')",
-		email, pdfHeader.Filename, signerName, finalPdfPath)
+	// Tentukan Informasi Sertifikat
+	if signerName == "" {
+		signerName = cert.Subject.CommonName
+	}
+	issuerName := cert.Issuer.CommonName
+	if issuerName == "" {
+		issuerName = "DGSign"
+	}
+	validUntil := cert.NotAfter.UTC().Format("2006-01-02 15:04:05")
+	signedAt := time.Now().UTC().Format("2006-01-02 15:04:05")
+	uuidRecord := fmt.Sprintf("%d-%x", time.Now().UnixNano(), email)
 
-	fmt.Fprintf(w, "Dokumen berhasil ditandatangani!")
+	scheme := "https"
+	if r.TLS == nil {
+		scheme = "http"
+	}
+	hostNameOnly := strings.Split(r.Host, ":")[0]
+
+	// Gabungkan dengan port 3000
+	verifyURL := fmt.Sprintf("%s://%s:3000/verify/%s", scheme, hostNameOnly, uuidRecord)
+
+	// Generate Visual Signature (Custom PNG atau Otomatis QR)
+	var visualBytes []byte
+	if len(customImageBytes) > 0 {
+		visualBytes = customImageBytes
+	} else {
+		textLines := []string{
+			"Digitally Signed",
+			fmt.Sprintf("Signer: %s", signerName),
+			fmt.Sprintf("Email: %s", email),
+			fmt.Sprintf("Date: %s", signedAt),
+			fmt.Sprintf("Issuer: %s", issuerName),
+		}
+		visualBytes, _ = generateSignatureVisualBytes(textLines, verifyURL, int(boxW), int(boxH))
+	}
+
+	signedOutputPath := filepath.Join("uploads", fmt.Sprintf("signed_%d_%s", time.Now().UnixNano(), pdfHeader.Filename))
+	signedOutput, _ := os.Create(signedOutputPath)
+
+	signData := sign.SignData{
+		Signature:   sign.SignDataSignature{CertType: sign.ApprovalSignature},
+		Signer:      privateKey.(crypto.Signer),
+		Certificate: cert,
+		Appearance: sign.Appearance{
+			Visible:    true,
+			Page:       uint32(pageNo),
+			LowerLeftX: xPos, LowerLeftY: yPos,
+			UpperRightX: xPos + boxW, UpperRightY: yPos + boxH,
+			Image:            visualBytes,
+			ImageAsWatermark: false,
+		},
+	}
+
+	if err := sign.Sign(inputPdf, signedOutput, pdfReader, finfo.Size(), signData); err != nil {
+		http.Error(w, "Gagal tanda tangan", http.StatusInternalServerError)
+		return
+	}
+	signedOutput.Close()
+
+	// Update Database
+	var userID int
+	db.QueryRow("SELECT id FROM users WHERE email = ?", email).Scan(&userID)
+
+	fileHash := "hash_error"
+	if signedBytes, err := os.ReadFile(signedOutputPath); err == nil {
+		hash := sha256.Sum256(signedBytes)
+		fileHash = hex.EncodeToString(hash[:])
+	}
+	certSerial := cert.SerialNumber.String()
+
+	// Insert ke signed_documents
+	db.Exec(`
+		INSERT INTO signed_documents 
+		(uuid, user_id, filename, file_path, hash_sha256, certificate_serial, signer_email, signed_at, verification_token, created_at, updated_at, signer_name, issuer_name, valid_until) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, uuidRecord, userID, pdfHeader.Filename, signedOutputPath, fileHash, certSerial, email, signedAt, fileHash, signedAt, signedAt, signerName, issuerName, validUntil)
+
+	// Update Workflow (PENTING: pakai file_path agar kebaca di React)
+	historyStatus := "menunggu"
+	if workflowID != "" && workflowID != "0" && workflowID != "null" && workflowID != "undefined" {
+		historyStatus = "ditandatangani"
+		db.Exec("UPDATE document_workflows SET status = 'ditandatangani', file_path = ? WHERE id = ?", signedOutputPath, workflowID)
+	}
+
+	// Insert ke history
+	db.Exec(`
+		INSERT INTO document_history 
+		(email, document_name, signer_name, file_path, signed_at, status, file_token) 
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, email, pdfHeader.Filename, signerName, signedOutputPath, signedAt, historyStatus, uuidRecord)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "Dokumen berhasil ditandatangani!",
+	})
 }
 
 // 8. Ambil Riwayat Dokumen
 func historyHandler(w http.ResponseWriter, r *http.Request) {
-	email := r.URL.Query().Get("email")
-	// Ambil data berdasarkan email user beserta statusnya
-	rows, err := db.Query("SELECT id, document_name, signer_name, signed_at, status FROM document_history WHERE email = ? ORDER BY signed_at DESC", email)
+	// Pastikan CORS dan Header aman
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+
+	email := normalizeEmail(r.URL.Query().Get("email"))
+
+	// Gunakan COALESCE agar jika ada data NULL, diubah jadi string kosong "" (mencegah error scan)
+	query := `
+		SELECT id, document_name, COALESCE(signer_name, ''), signed_at, COALESCE(file_token, ''), COALESCE(status, '') 
+		FROM document_history 
+		WHERE email = ? 
+		ORDER BY id DESC
+	`
+
+	// ORDER BY id DESC lebih aman daripada signed_at DESC kalau format waktunya kadang beda
+	rows, err := db.Query(query, email)
 	if err != nil {
+		fmt.Println("Error query history:", err)
 		http.Error(w, "Gagal mengambil data", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
 
-	var histories []HistoryItem
+	var histories []HistoryItem = []HistoryItem{} // Inisialisasi array kosong, jangan biarkan nil
 	for rows.Next() {
 		var h HistoryItem
-		rows.Scan(&h.ID, &h.DocumentName, &h.SignerName, &h.SignedAt, &h.Status)
+		err := rows.Scan(&h.ID, &h.DocumentName, &h.SignerName, &h.SignedAt, &h.FileToken, &h.Status)
+		if err != nil {
+			fmt.Println("Error scan baris history:", err) // Biar kelihatan di terminal kalau ada error
+			continue
+		}
 		histories = append(histories, h)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(histories)
 }
 
 // 9. Download Dokumen dari Riwayat
 func downloadDocumentHandler(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
+	// Ambil TOKEN, bukan ID lagi
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		http.Error(w, "Akses ditolak. Token tidak valid.", http.StatusForbidden)
+		return
+	}
 
-	// 1. Ambil data dari DB
 	var filePath, docName, status string
-	err := db.QueryRow("SELECT file_path, document_name, status FROM document_history WHERE id = ?", id).Scan(&filePath, &docName, &status)
+	// Cari berdasarkan file_token
+	err := db.QueryRow("SELECT file_path, document_name, status FROM document_history WHERE file_token = ?", token).Scan(&filePath, &docName, &status)
 	if err != nil {
-		http.Error(w, "Dokumen tidak ditemukan", http.StatusNotFound)
+		http.Error(w, "Dokumen tidak ditemukan di server", http.StatusNotFound)
 		return
 	}
 
@@ -402,113 +837,176 @@ func downloadDocumentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. DEBUG: Lihat di mana terminal Golang berada
-	wd, _ := os.Getwd()
-	fmt.Println("INFO: Current Working Directory (Folder Terminal):", wd)
-
-	// 3. NORMALISASI PATH (Paling Penting)
-	// Kita bersihkan path dari database agar kompatibel dengan sistem OS
-	// Jika path di DB "uploads\file.pdf", kita pastikan Go membacanya dengan benar
 	cleanPath := filepath.Clean(filePath)
 
-	// Jika path di DB dimulai dengan "uploads", kita pastikan itu relatif terhadap folder saat ini
-	// (Penting: Pastikan terminal Anda berada di dalam folder 'backend')
-	finalPath := cleanPath
-
-	fmt.Println("DEBUG: Mencoba mencari file di path:", finalPath)
-
-	// 4. Cek file
-	if _, err := os.Stat(finalPath); os.IsNotExist(err) {
-		fmt.Println("ERROR: File tidak ditemukan di lokasi:", finalPath)
-		// Coba cari alternatif: mungkin file ada di folder 'backend/uploads' tapi saat ini
-		// terminal dibuka di 'digital-sign'?
-		// Solusi darurat: Coba cek apakah file ada di "backend/" + finalPath
-		altPath := filepath.Join("backend", finalPath)
-		if _, err := os.Stat(altPath); err == nil {
-			finalPath = altPath
-		} else {
-			http.Error(w, "File fisik tidak ditemukan di server.", http.StatusNotFound)
-			return
-		}
-	}
-
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", docName))
-	w.Header().Set("Content-Type", "application/pdf")
-	http.ServeFile(w, r, finalPath)
-}
-
-// 10. Verifikasi Keaslian Dokumen (Dengan Cek Detail Duplikat)
-// 10. Verifikasi Keaslian Dokumen (Mendukung File Hasil Unduhan "Signed_")
-func verifyDocumentHandler(w http.ResponseWriter, r *http.Request) {
-	err := r.ParseMultipartForm(10 << 20)
-	if err != nil {
-		http.Error(w, "Gagal membaca file", http.StatusBadRequest)
+	if _, err := os.Stat(cleanPath); os.IsNotExist(err) {
+		http.Error(w, "File fisik tidak ditemukan", http.StatusNotFound)
 		return
 	}
 
-	pdfFile, pdfHeader, err := r.FormFile("file")
+	// Sembunyikan path asli di browser, hanya kirim nama dokumen
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", docName))
+	w.Header().Set("Content-Type", "application/pdf")
+	http.ServeFile(w, r, cleanPath)
+}
+
+func downloadSignedDocumentHandler(w http.ResponseWriter, r *http.Request) {
+	uuid := r.URL.Query().Get("uuid")
+	if uuid == "" {
+		http.Error(w, "UUID dokumen wajib diisi", http.StatusBadRequest)
+		return
+	}
+
+	var fileName, filePath string
+	err := db.QueryRow("SELECT filename, file_path FROM signed_documents WHERE uuid = ?", uuid).Scan(&fileName, &filePath)
+	if err != nil {
+		http.Error(w, "Dokumen tidak ditemukan", http.StatusNotFound)
+		return
+	}
+
+	cleanPath := filepath.Clean(filePath)
+	if _, err := os.Stat(cleanPath); err != nil {
+		http.Error(w, "File hasil tanda tangan tidak ditemukan", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fileName))
+	w.Header().Set("Content-Type", "application/pdf")
+	http.ServeFile(w, r, cleanPath)
+}
+
+func verifySignedDocumentHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// =========================================================
+	// GEMBOK API (IMPLEMENTASI OPSI 1)
+	// Pastikan ada email yang dikirim dari React.
+	// Kalau kosong, berarti hacker nembak URL tanpa login.
+	// =========================================================
+	// Ambil requester
+	requesterEmail := r.URL.Query().Get("requester")
+	uuid := strings.TrimPrefix(r.URL.Path, "/verify/")
+
+	// --- LOGIKA "MENIPU" PENGGUNA ---
+	// Jika tidak ada email (belum login) ATAU UUID tidak valid,
+	// JANGAN KASIH TAU ALASANNYA. Cukup bilang dokumen tidak ada.
+	if requesterEmail == "" || uuid == "" || uuid == "/verify" {
+		http.Error(w, `{"error": "Dokumen tidak ditemukan."}`, http.StatusNotFound)
+		return
+	}
+
+	var record struct {
+		UUID              string
+		Filename          string
+		FilePath          string
+		HashSHA256        string
+		CertificateSerial string
+		SignerName        string
+		SignerEmail       string
+		IssuerName        string
+		ValidUntil        time.Time
+		SignedAt          time.Time
+	}
+
+	// Bersih tanpa hitungan scan_count
+	err := db.QueryRow(`
+		SELECT uuid, filename, file_path, hash_sha256, certificate_serial, signer_name, signer_email, issuer_name, valid_until, signed_at
+		FROM signed_documents WHERE uuid = ?
+	`, uuid).Scan(&record.UUID, &record.Filename, &record.FilePath, &record.HashSHA256, &record.CertificateSerial, &record.SignerName, &record.SignerEmail, &record.IssuerName, &record.ValidUntil, &record.SignedAt)
+
+	if err != nil {
+		fmt.Println("[ERROR VERIFY DB]:", err)
+		http.Error(w, `{"error": "Dokumen tidak ditemukan."}`, http.StatusNotFound)
+		return
+	}
+
+	// Proses pengecekan keaslian file (Hash Matching)
+
+	cleanPath := filepath.Clean(record.FilePath)
+	isValid := false
+	if data, err := os.ReadFile(cleanPath); err == nil {
+		hash := sha256.Sum256(data)
+		isValid = hex.EncodeToString(hash[:]) == record.HashSHA256
+	}
+
+	// Kirim data ke React
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"isValid":           isValid,
+		"signerName":        record.SignerName,
+		"signerEmail":       record.SignerEmail,
+		"issuerName":        record.IssuerName,
+		"certificateSerial": record.CertificateSerial,
+		"signedAt":          record.SignedAt.Format("02 Jan 2006 15:04:05"),
+		"validUntil":        record.ValidUntil.Format("02 Jan 2006 15:04:05"),
+		"filename":          record.Filename,
+	})
+}
+
+func verifyDocumentHandler(w http.ResponseWriter, r *http.Request) {
+	// 1. Baca File dari Upload
+	err := r.ParseMultipartForm(10 << 20)
+	if err != nil {
+		http.Error(w, "Gagal membaca form", http.StatusBadRequest)
+		return
+	}
+
+	pdfFile, _, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "File PDF tidak ditemukan", http.StatusBadRequest)
 		return
 	}
 	defer pdfFile.Close()
 
-	// --- LOGIKA BARU: PEMBERSIHAN NAMA FILE HASIL UNDUHAN ---
-	filename := pdfHeader.Filename
+	// 2. HITUNG HASH FILE YANG DIUPLOAD (Ini kuncinya!)
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, pdfFile); err != nil {
+		http.Error(w, "Gagal memproses file", http.StatusInternalServerError)
+		return
+	}
+	uploadedHash := hex.EncodeToString(hasher.Sum(nil))
 
-	// 1. Hapus prefix "Signed_" dari hasil unduhan
-	filename = strings.TrimPrefix(filename, "Signed_")
+	// 3. CARI DI DB BERDASARKAN HASH (Bukan Nama File)
+	var record struct {
+		UUID        string
+		SignerName  string
+		SignerEmail string
+		SignedAt    time.Time
+		ValidUntil  time.Time
+		IssuerName  string
+	}
 
-	// 2. Hapus angka duplikasi dari browser seperti " (1)", " (7)", dsb.
-	// Ini akan mengubah "nama file (7).pdf" kembali menjadi "nama file.pdf"
-	re := regexp.MustCompile(` \(\d+\)\.pdf$`)
-	filename = re.ReplaceAllString(filename, ".pdf")
-	// ----------------------------------------------------------------------
+	// Cari apakah hash ini ada di database kita
+	err = db.QueryRow(`
+        SELECT uuid, signer_name, signer_email, signed_at, valid_until, issuer_name 
+        FROM signed_documents 
+        WHERE hash_sha256 = ?`, uploadedHash).Scan(
+		&record.UUID, &record.SignerName, &record.SignerEmail, &record.SignedAt, &record.ValidUntil, &record.IssuerName,
+	)
 
-	// Ambil SEMUA data riwayat berdasarkan nama file asli yang sudah dibersihkan total
-	rows, err := db.Query("SELECT signer_name, signed_at FROM document_history WHERE document_name = ? ORDER BY signed_at ASC", filename)
+	// 4. JIKA TIDAK DITEMUKAN BERARTI DOKUMEN PALSU/DIMODIFIKASI
 	if err != nil {
-		http.Error(w, "Terjadi kesalahan database", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	type SignerInfo struct {
-		Name string
-		Date string
-	}
-	var signers []SignerInfo
-
-	for rows.Next() {
-		var sName, sDate string
-		rows.Scan(&sName, &sDate)
-		signers = append(signers, SignerInfo{Name: sName, Date: sDate})
-	}
-
-	if len(signers) == 0 {
-		http.Error(w, "Tanda tangan digital tidak ditemukan atau tidak valid pada sistem kami.", http.StatusNotFound)
+		// Kalau hash-nya beda, berarti isinya sudah diubah atau bukan dokumen asli
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"isValid": false,
+			"message": "Dokumen tidak valid atau telah dimodifikasi.",
+		})
 		return
 	}
 
-	if len(signers) > 1 {
-		originalSigner := signers[0].Name
-		var duplicators []string
-		for i := 1; i < len(signers); i++ {
-			duplicators = append(duplicators, signers[i].Name)
-		}
-		duplicatorNames := strings.Join(duplicators, ", ")
-		errMsg := fmt.Sprintf("PERINGATAN: Dokumen Terduplikasi!\n\n✅ Dokumen asli pertama kali ditandatangani oleh:\n- %s\n\n⚠️ Dokumen ini kemudian diduplikasi/ditandatangani ulang oleh:\n- %s", originalSigner, duplicatorNames)
-
-		http.Error(w, errMsg, http.StatusConflict)
-		return
-	}
-
+	// 5. JIKA KETEMU, BERARTI ASLI
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "VALID",
-		"signer":  signers[0].Name,
-		"date":    signers[0].Date,
-		"message": "Dokumen ini valid dan memiliki tanda tangan digital yang sah.",
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"isValid": true,
+		"message": "Dokumen Asli & Tanda Tangan Valid",
+		"certificate": map[string]string{
+			"signerName":  record.SignerName,
+			"signerEmail": record.SignerEmail,
+			"signedAt":    record.SignedAt.Format("02 Jan 2006 15:04:05"),
+			"validUntil":  record.ValidUntil.Format("02 Jan 2006 15:04:05"),
+			"issuerName":  record.IssuerName,
+		},
 	})
 }
 
@@ -559,7 +1057,7 @@ func adminUpdateLifecycleHandler(w http.ResponseWriter, r *http.Request) {
 
 // 12 Menampilkan semua dokumen dari semua user untuk Admin
 func adminHistoryHandler(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT id, email, document_name, signer_name, signed_at, status FROM document_history ORDER BY signed_at DESC")
+	rows, err := db.Query("SELECT id, email, document_name, signer_name, signed_at, status FROM document_history ORDER BY id DESC")
 	if err != nil {
 		http.Error(w, "Gagal mengambil data admin", http.StatusInternalServerError)
 		return
@@ -640,6 +1138,279 @@ func setupAdminHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "SUKSES!\nAkun Admin berhasil dibuat.\n\nSilakan login ke Web Portal dengan:\nEmail: %s\nPassword: %s", email, pass)
 }
 
+func resetP12Handler(w http.ResponseWriter, r *http.Request) {
+	// Pastikan hanya menerima method POST
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method tidak diizinkan", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var payload struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "Data tidak valid", http.StatusBadRequest)
+		return
+	}
+
+	// Update kolom has_p12 menjadi FALSE di database
+	_, err := db.Exec("UPDATE users SET has_p12 = FALSE WHERE email = ?", payload.Email)
+	if err != nil {
+		fmt.Println("[ERROR] Gagal mereset status p12:", err)
+		http.Error(w, "Gagal melakukan reset sertifikat di sistem", http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Printf("[RESET] Sertifikat milik %s telah di-reset.\n", payload.Email)
+	w.Write([]byte("Digital ID (.p12) berhasil di-reset. Anda sekarang dapat membuat sertifikat baru."))
+}
+
+func extractCertHandler(w http.ResponseWriter, r *http.Request) {
+	// 1. Ambil file .p12 dari form
+	p12File, header, err := r.FormFile("p12_file")
+	if err != nil {
+		http.Error(w, "File .p12 tidak ditemukan", http.StatusBadRequest)
+		return
+	}
+	defer p12File.Close()
+
+	// 2. Baca file ke dalam bytes
+	p12Bytes, err := io.ReadAll(p12File)
+	if err != nil {
+		http.Error(w, "Gagal membaca file", http.StatusInternalServerError)
+		return
+	}
+
+	// 3. Ambil passphrase
+	passphrase := r.FormValue("passphrase")
+
+	// 4. Dekripsi dan Ekstrak PKCS#12
+	// Kita mengabaikan privateKey (pakai garis bawah _) karena kita hanya butuh cert (Sertifikat Publik)
+	_, cert, err := pkcs12.Decode(p12Bytes, passphrase)
+	if err != nil {
+		http.Error(w, "Passphrase salah atau file rusak", http.StatusUnauthorized)
+		return
+	}
+
+	// 5. Ubah format sertifikat (DER) menjadi format PEM (crt/cer standard)
+	pemBlock := &pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: cert.Raw,
+	}
+	pemBytes := pem.EncodeToMemory(pemBlock)
+
+	// 6. Kirim sebagai file .crt yang bisa didownload
+	// Ganti nama file sesuai nama aslinya ditambah .crt
+	outFilename := header.Filename + "_Public.crt"
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", outFilename))
+	w.Header().Set("Content-Type", "application/x-x509-ca-cert")
+
+	w.Write(pemBytes)
+}
+
+// --- API BARU UNTUK WORKFLOW ---
+
+// A. Mahasiswa Mengajukan Dokumen
+func workflowCreateHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	err := r.ParseMultipartForm(20 << 20) // Maksimal 20MB
+	if err != nil {
+		http.Error(w, "Gagal memproses form", http.StatusBadRequest)
+		return
+	}
+
+	mahasiswaEmail := r.FormValue("mahasiswa_email")
+	dosenEmail := r.FormValue("dosen_email")
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "File PDF wajib diunggah", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	// 1. BUAT FOLDER JIKA BELUM ADA
+	os.MkdirAll("workflows", os.ModePerm)
+
+	// 2. SIMPAN FILE FISIK KE FOLDER WORKFLOWS
+	// Bikin nama unik biar nggak bentrok kalau ada file yang namanya sama
+	hashName := fmt.Sprintf("wf_%d_%s", time.Now().Unix(), header.Filename)
+	savePath := filepath.Join("workflows", hashName)
+
+	dst, err := os.Create(savePath)
+	if err != nil {
+		http.Error(w, "Gagal menyimpan file ke server", http.StatusInternalServerError)
+		return
+	}
+	defer dst.Close()
+	io.Copy(dst, file)
+
+	// 3. SIMPAN KE DATABASE (PENTING: savePath dimasukkan ke kolom file_path)
+	_, err = db.Exec(`
+		INSERT INTO document_workflows 
+		(mahasiswa_email, dosen_email, document_name, file_path, status, created_at) 
+		VALUES (?, ?, ?, ?, 'menunggu_dosen', NOW())
+	`, mahasiswaEmail, dosenEmail, header.Filename, savePath)
+
+	if err != nil {
+		fmt.Println("Gagal insert ke database:", err)
+		http.Error(w, "Gagal menyimpan data ke database", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"message": "Berhasil upload"}`))
+}
+
+type Workflow struct {
+	ID             int    `json:"id"`
+	MahasiswaEmail string `json:"mahasiswa_email"`
+	DosenEmail     string `json:"dosen_email"`
+	DocumentName   string `json:"document_name"`
+	Status         string `json:"status"`
+	CreatedAt      string `json:"created_at"`
+	FilePath       string `json:"file_path"`
+}
+
+// 1. HANDLER LIST WORKFLOW (Mengirim data lengkap ke semua role)
+func workflowListHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+
+	email := r.URL.Query().Get("email")
+	role := r.URL.Query().Get("role")
+
+	var rows *sql.Rows
+	var err error
+
+	// Menggunakan COALESCE agar jika file_path NULL di database, Golang membacanya sebagai string kosong ""
+	if role == "admin" {
+		rows, err = db.Query("SELECT id, mahasiswa_email, dosen_email, document_name, status, created_at, COALESCE(file_path, '') FROM document_workflows WHERE status IN ('ditandatangani', 'selesai', 'diterima_dosen') ORDER BY id DESC")
+	} else if role == "dosen" {
+		rows, err = db.Query("SELECT id, mahasiswa_email, dosen_email, document_name, status, created_at, COALESCE(file_path, '') FROM document_workflows WHERE dosen_email = ? ORDER BY id DESC", email)
+	} else {
+		rows, err = db.Query("SELECT id, mahasiswa_email, dosen_email, document_name, status, created_at, COALESCE(file_path, '') FROM document_workflows WHERE mahasiswa_email = ? ORDER BY id DESC", email)
+	}
+
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var workflows []Workflow = []Workflow{}
+	for rows.Next() {
+		var wf Workflow
+		err := rows.Scan(&wf.ID, &wf.MahasiswaEmail, &wf.DosenEmail, &wf.DocumentName, &wf.Status, &wf.CreatedAt, &wf.FilePath)
+		if err != nil {
+			fmt.Println("Error scan baris:", err)
+			continue
+		}
+		workflows = append(workflows, wf)
+	}
+
+	json.NewEncoder(w).Encode(workflows)
+}
+
+// 2. HANDLER UPDATE STATUS (Untuk aksi Dosen Terima dan Admin Setuju)
+func workflowActionHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	var req struct {
+		ID     int    `json:"id"`
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	var targetStatus string
+	if req.Action == "diterima_dosen" {
+		targetStatus = "diterima_dosen"
+	} else if req.Action == "selesai" {
+		targetStatus = "selesai"
+	}
+
+	if targetStatus != "" {
+		_, err := db.Exec("UPDATE document_workflows SET status = ? WHERE id = ?", targetStatus, req.ID)
+		if err != nil {
+			http.Error(w, "Gagal update status database", http.StatusInternalServerError)
+			return
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// 3. HANDLER GET FILE (Mengirimkan file fisik PDF ke React)
+func getFileHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	filePath := r.URL.Query().Get("path")
+	safePath := filepath.Clean(filePath)
+
+	if _, err := os.Stat(safePath); os.IsNotExist(err) {
+		http.Error(w, "File fisik tidak ditemukan di server", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/pdf")
+	http.ServeFile(w, r, safePath)
+}
+
+// Tambahkan fungsi ini di main.go
+func getDosenListHandler(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query("SELECT email, name FROM users WHERE role = 'dosen'")
+	if err != nil {
+		http.Error(w, "Gagal mengambil data dosen", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var dosens []map[string]string
+	for rows.Next() {
+		var email, name string
+		rows.Scan(&email, &name)
+		dosens = append(dosens, map[string]string{"email": email, "name": name})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(dosens)
+}
+
+func viewDocumentHandler(w http.ResponseWriter, r *http.Request) {
+	// 1. Ambil UUID dari URL
+	uuid := strings.TrimPrefix(r.URL.Path, "/view/")
+
+	// 2. Ambil path file dari DB
+	var filePath string
+	err := db.QueryRow("SELECT file_path FROM signed_documents WHERE uuid = ?", uuid).Scan(&filePath)
+	if err != nil {
+		http.Error(w, "Dokumen tidak ditemukan", http.StatusNotFound)
+		return
+	}
+
+	// 3. Serve file PDF ke browser
+	// Set header agar browser langsung menampilkan PDF (bukan download otomatis)
+	w.Header().Set("Content-Type", "application/pdf")
+	w.Header().Set("Content-Disposition", "inline; filename=document.pdf")
+
+	http.ServeFile(w, r, filePath)
+}
+
 func main() {
 	initDB()
 	mux := http.NewServeMux()
@@ -652,12 +1423,22 @@ func main() {
 	mux.HandleFunc("/web-sign", webSignHandler)
 	mux.HandleFunc("/history", historyHandler)
 	mux.HandleFunc("/download", downloadDocumentHandler)
+	mux.HandleFunc("/download-signed", downloadSignedDocumentHandler)
 	mux.HandleFunc("/verify-pdf", verifyDocumentHandler)
+	mux.HandleFunc("/verify/", verifySignedDocumentHandler)
 	mux.HandleFunc("/request-id-lifecycle", requestDigitalIDLifecycleHandler)
 	mux.HandleFunc("/admin/update-status", adminUpdateLifecycleHandler)
 	mux.HandleFunc("/admin/history", adminHistoryHandler)
 	mux.HandleFunc("/admin/approve", adminApproveDocumentHandler)
 	mux.HandleFunc("/setup-admin", setupAdminHandler)
+	mux.HandleFunc("/reset-p12", resetP12Handler)
+	mux.HandleFunc("/extract-cert", extractCertHandler)
+	mux.HandleFunc("/workflow/create", workflowCreateHandler)
+	mux.HandleFunc("/workflow/list", workflowListHandler)
+	mux.HandleFunc("/workflow/action", workflowActionHandler)
+	mux.HandleFunc("/dosen/list", getDosenListHandler)
+	mux.HandleFunc("/get-file", getFileHandler)
+	mux.HandleFunc("/view/", viewDocumentHandler)
 
 	c := cors.New(cors.Options{
 		AllowedOrigins: []string{"http://localhost:3000", "https://dgsign.test:3000"}, // Tambahkan origin HTTPS
@@ -665,5 +1446,21 @@ func main() {
 		AllowedHeaders: []string{"Content-Type"},
 	})
 	fmt.Println("Backend HTTPS berjalan di port 8081...")
-	log.Fatal(http.ListenAndServeTLS(":8081", "cert.pem", "key.pem", c.Handler(mux)))
+
+	fmt.Println("==================================================")
+	fmt.Println("🚀 SERVER SIAP TEMPUR!")
+	fmt.Println("⚠️  JALUR MERAH : HTTP (Tanpa SSL) aktif di port 8080")
+	fmt.Println("🔒 JALUR AMAN  : HTTPS (Dengan SSL) aktif di port 8081")
+	go func() {
+		err := http.ListenAndServe(":8080", c.Handler(mux))
+		if err != nil {
+			log.Fatal("Gagal menjalankan HTTP:", err)
+		}
+	}()
+
+	// 2. Jalankan HTTPS (SSL) sebagai proses utama
+	errTls := http.ListenAndServeTLS(":8081", "cert.pem", "key.pem", c.Handler(mux))
+	if errTls != nil {
+		log.Fatal("Gagal menjalankan HTTPS (Pastikan cert.pem & key.pem ada):", errTls)
+	}
 }

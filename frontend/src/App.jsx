@@ -1,8 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { QRCodeCanvas } from 'qrcode.react';
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import axios from 'axios';
 import SignDocument from './SignDocument';
 import AdminDashboard from './AdminDasboard'; // IMPORT KOMPONEN ADMIN
+import VerifyDocument from './VerifyDocument';
+import Workflow from './Workflow';
 
 // --- TEMA & STYLING MINIMALIS ---
 const theme = {
@@ -28,11 +31,13 @@ const styles = {
   menuItem: (active) => ({ padding: '12px 16px', marginBottom: '8px', borderRadius: '8px', cursor: 'pointer', backgroundColor: active ? '#EEF2FF' : 'transparent', color: active ? theme.primary : theme.text, fontWeight: active ? '600' : '400' })
 };
 
-function App() {
+function MainApp() {
   // appState: 'AUTH' | 'SETUP_OTP' | 'VERIFY_OTP' | 'DASHBOARD'
   const [appState, setAppState] = useState('AUTH');
   const [authMode, setAuthMode] = useState('login');
   
+  const [hasP12, setHasP12] = useState(false); // State untuk mengunci tombol
+  const [extractData, setExtractData] = useState({ file: null, passphrase: '' });
   // Data Sesi
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -51,6 +56,14 @@ function App() {
 
   const [signaturePos, setSignaturePos] = useState({ page: 1, x: 100, y: 150 });
 
+  const [docToSign, setDocToSign] = useState(null); // State untuk simpan data dokumen
+
+// Fungsi ini akan dipanggil oleh Workflow.jsx
+  const prepareSign = (wf) => {
+    setDocToSign(wf); // Simpan data dokumen
+    setActiveMenu('upload'); // Pindah tab
+  };
+
   const handlePdfClick = (e) => {
     const rect = e.target.getBoundingClientRect();
     const clickX = e.clientX - rect.left; 
@@ -64,6 +77,40 @@ function App() {
       setHistoryList(res.data || []);
     } catch (err) {
       console.error("Gagal mengambil riwayat:", err);
+    }
+  };
+
+  const handleExtractCert = async (e) => {
+    e.preventDefault();
+    if (!extractData.file) return alert("Harap pilih file .p12!");
+    const formData = new FormData();
+    formData.append('p12_file', extractData.file);
+    formData.append('passphrase', extractData.passphrase);
+    try {
+      const res = await axios.post('https://dgsign.test:8081/extract-cert', formData, { responseType: 'blob' });
+      const url = window.URL.createObjectURL(new Blob([res.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', `${email}_Public.crt`);
+      document.body.appendChild(link);
+      link.click();
+      alert("Sertifikat Publik (.crt) berhasil diekstrak!");
+      setExtractData({ file: null, passphrase: '' });
+      e.target.reset();
+    } catch (err) {
+      alert("Gagal mengekstrak sertifikat.");
+    }
+  };
+
+  // FUNGSI 2: RESET
+  const handleResetP12 = async () => {
+    if (!window.confirm("Yakin ingin mereset Digital ID?")) return;
+    try {
+      const res = await axios.post('https://dgsign.test:8081/reset-p12', { email });
+      alert(res.data);
+      setHasP12(false); 
+    } catch (err) {
+      alert("Gagal mereset: " + (err.response?.data || err.message));
     }
   };
 
@@ -87,19 +134,26 @@ function App() {
         setAuthMode('login');
       } else {
         const res = await axios.post('https://dgsign.test:8081/login', { email, password });
+
+        console.log("DATA LOGIN DARI BACKEND:", res.data);
         
         // TANGKAP ROLE DARI BACKEND
         const userRole = res.data.role || 'user';
         setRole(userRole); 
+        setHasP12(res.data.has_p12 || false);
+
+        localStorage.setItem('email', email);      // Simpan email
+        localStorage.setItem('role', userRole);    // Simpan role
 
         // ========================================================
         // LOGIKA BARU: BYPASS OTP KHUSUS UNTUK ADMIN
         // ========================================================
         if (userRole === 'admin') {
           setAppState('DASHBOARD'); // Langsung masuk sistem
-          setActiveMenu('admin');   // Otomatis membuka tab Dashboard Admin
+          setActiveMenu('admin');
           return;                   // Hentikan proses agar tidak membaca OTP di bawahnya
         }
+
         // ========================================================
 
         // Jika dia adalah 'user' biasa, jalankan alur OTP seperti biasa
@@ -155,7 +209,7 @@ function App() {
     }
   };
 
-  const handleDownload = async (id, docName, status) => {
+  const handleDownload = async (id, docName, status, token) => {
     // BLOKIR DOWNLOAD JIKA STATUS BELUM DISETUJUI
     if (status !== undefined && status !== 'disetujui') {
         alert(`Dokumen tidak dapat diunduh. Status saat ini: ${status.toUpperCase()}`);
@@ -163,11 +217,11 @@ function App() {
     }
 
     try {
-      const response = await axios.get(`https://dgsign.test:8081/download?id=${id}`, { responseType: 'blob' });
+      const response = await axios.get(`https://dgsign.test:8081/download?token=${token}`, { responseType: 'blob' });
       const url = window.URL.createObjectURL(new Blob([response.data]));
       const link = document.createElement('a');
       link.href = url;
-      link.setAttribute('download', `Signed_${docName}`); 
+      link.setAttribute('download', `${docName}`); 
       document.body.appendChild(link);
       link.click();
     } catch (err) {
@@ -194,6 +248,7 @@ function App() {
 
   const handleSignDocument = async (e) => {
     e.preventDefault();
+    const token = localStorage.getItem('token');
     const formData = new FormData();
     formData.append('email', email);
     formData.append('otpCode', signData.otp);
@@ -209,7 +264,10 @@ function App() {
 
     try {
       const res = await axios.post('https://dgsign.test:8081/web-sign', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' }
+        headers: { 
+          'Content-Type': 'multipart/form-data' ,
+          'Authorization': `Bearer ${token}`
+        }
       });
       alert(res.data);
       setSignData({ signerName: '', passphrase: '', otp: '', file: null, signatureImage: null });
@@ -231,15 +289,12 @@ function App() {
         link.click();
         
         alert("Digital ID (.p12) berhasil dibuat dan diunduh. Anda sekarang dapat menggunakannya di platform ini maupun di-import ke Adobe Acrobat.");
+        setHasP12(true); // Set state untuk mengunci tombol setelah berhasil membuat ID
       } catch (err) { 
         const errorText = await err.response?.data.text();
         alert(errorText || "Gagal membuat ID."); 
       }
     };
-
-  // ==========================================
-  // RENDER TAMPILAN
-  // ==========================================
 
   if (appState === 'AUTH') {
     return (
@@ -250,7 +305,7 @@ function App() {
             <p style={{ textAlign: 'center', color: theme.textMuted, marginBottom: '30px', fontSize: '14px' }}>Sistem Tanda Tangan Digital Terpadu</p>
             
             <form onSubmit={handleAuth}>
-              <input style={styles.input} type="email" placeholder="Alamat Email (mis: nama@unila.ac.id)" required value={email} onChange={e => setEmail(e.target.value)} />
+              <input style={styles.input} type="email" placeholder="Alamat Email" required value={email} onChange={e => setEmail(e.target.value)} />
               <input style={styles.input} type="password" placeholder="Kata Sandi" required value={password} onChange={e => setPassword(e.target.value)} />
               <button style={styles.btn} type="submit">{authMode === 'login' ? 'Masuk' : 'Buat Akun'}</button>
             </form>
@@ -311,40 +366,72 @@ function App() {
   // TAMPILAN 4: MAIN DASHBOARD
   return (
     <div style={styles.container}>
-      {/* SIDEBAR */}
-      <div style={styles.sidebar}>
-        <h2 style={{ color: theme.primary, marginBottom: '30px', paddingLeft: '10px' }}>DGSign</h2>
+{/* SIDEBAR */}
+        <div style={styles.sidebar}>
+          <h2 style={{ color: theme.primary, marginBottom: '30px', paddingLeft: '10px' }}>DGSign</h2>
+          
+          <div style={{ flex: 1 }}>
+            {/* Menu untuk SEMUA (Mahasiswa, Dosen, Admin) */}
+            <div style={styles.menuItem(activeMenu === 'upload')} onClick={() => setActiveMenu('upload')}>✍️ Digital Signature</div>
+            
+            {/* MENU DINAMIS BERDASARKAN ROLE */}
+            {(role === 'user') && (
+                <div style={styles.menuItem(activeMenu === 'workflow')} onClick={() => setActiveMenu('workflow')}>🔄 Pengajuan Saya</div>
+            )}
+            
+            {(role === 'dosen' || role === 'admin') && (
+                <div style={styles.menuItem(activeMenu === 'workflow')} onClick={() => setActiveMenu('workflow')}>📥 Dokumen Masuk</div>
+            )}
+
+            <div style={styles.menuItem(activeMenu === 'history')} onClick={() => setActiveMenu('history')}>🗂️ Riwayat</div>
+            <div style={styles.menuItem(activeMenu === 'verify')} onClick={() => setActiveMenu('verify')}>✅ Verifikasi</div>
+            
+            <div style={{ margin: '20px 0', borderBottom: `1px solid ${theme.border}` }}></div>
+            <div style={styles.menuItem(activeMenu === 'settings')} onClick={() => setActiveMenu('settings')}>⚙️ Pengaturan</div>
+
+            {role === 'admin' && (
+              <div style={{ ...styles.menuItem(activeMenu === 'admin'), color: '#E11D48' }} onClick={() => setActiveMenu('admin')}>🛡️ Admin Dashboard</div>
+            )}
+          </div>
         
-        <div style={{ flex: 1 }}>
-          <div style={styles.menuItem(activeMenu === 'upload')} onClick={() => setActiveMenu('upload')}>✍️ Sign Document</div>
-          <div style={styles.menuItem(activeMenu === 'history')} onClick={() => setActiveMenu('history')}>🗂️ Riwayat Document</div>
-          <div style={styles.menuItem(activeMenu === 'verify')} onClick={() => setActiveMenu('verify')}>✅ Verifikasi Document</div>
-          <div style={{ margin: '20px 0', borderBottom: `1px solid ${theme.border}` }}></div>
-          <div style={styles.menuItem(activeMenu === 'settings')} onClick={() => setActiveMenu('settings')}>⚙️ Pengaturan ID</div>
-
-          {/* MENU KHUSUS ADMIN MUNCUL DI SINI */}
-          {role === 'admin' && (
-             <div 
-               style={{ ...styles.menuItem(activeMenu === 'admin'), color: '#E11D48', fontWeight: 'bold', marginTop: '10px' }} 
-               onClick={() => setActiveMenu('admin')}
-             >
-               🛡️ Dashboard Admin
-             </div>
-          )}
-        </div>
-
         <div style={{ padding: '15px', backgroundColor: '#F9FAFB', borderRadius: '8px', fontSize: '13px', color: theme.textMuted }}>
           Login sebagai:<br/><b style={{ color: theme.text }}>{email}</b>
-          <button style={{ ...styles.btnOutline, padding: '8px', marginTop: '15px' }} onClick={() => { setAppState('AUTH'); setEmail(''); setPassword(''); setRole('user'); }}>Keluar</button>
-        </div>
+            <button style={{ ...styles.btnOutline, padding: '8px', marginTop: '15px' }} onClick={() => { 
+              // 1. Kembalikan ke halaman login
+              setAppState('AUTH'); 
+              
+              // 2. Bersihkan data sesi pengguna
+              setEmail(''); 
+              setPassword(''); 
+              setRole('user'); 
+              
+              // 3. RESET STATE .P12 (Ini yang menghilangkan tombol ekstrak/reset)
+              setHasP12(false); 
+              setExtractData({ file: null, passphrase: '' }); 
+              
+              // 4. Kembalikan menu aktif ke default agar rapi
+              setActiveMenu('upload'); 
+              
+              // (Opsional) Jika Anda menyimpan token di localStorage, hapus juga di sini:
+              // localStorage.removeItem('token');
+              localStorage.removeItem('email');
+              localStorage.removeItem('role');
+            }}>
+              Keluar
+            </button>        
+          </div>
       </div>
 
       {/* CONTENT AREA */}
       <div style={styles.content}>
-        <div style={{ maxWidth: '800px', backgroundColor: theme.card, padding: '40px', borderRadius: theme.radius, boxShadow: theme.shadow }}>
+        <div style={{ minWidth: 'fit-content', width: '95%', backgroundColor: theme.card, padding: '40px', borderRadius: theme.radius, boxShadow: theme.shadow }}>
           
           {/* MENU 1: SIGN/UPLOAD DOCUMENT */}
-          {activeMenu === 'upload' && <SignDocument userEmail={email} />}
+          {activeMenu === 'upload' && role !== 'mahasiswa' && (
+            <SignDocument userEmail={email} docToSign={docToSign} clearDoc={() => setDocToSign(null)} />
+          )}
+
+          {activeMenu === 'workflow' && <Workflow email={email} role={role} onPrepareSign={prepareSign} />}
 
           {/* MENU 2: RIWAYAT DOCUMENT */}
           {activeMenu === 'history' && (
@@ -379,7 +466,7 @@ function App() {
                           <td style={{ padding: '12px', color: theme.textMuted }}>{new Date(item.signed_at).toLocaleString('id-ID')}</td>
                           <td style={{ padding: '12px', textAlign: 'center' }}>
                             <button 
-                              onClick={() => handleDownload(item.id, item.document_name, item.status)}
+                              onClick={() => handleDownload(item.id, item.document_name, item.status, item.file_token)}
                               disabled={item.status !== 'disetujui'}
                               style={{ 
                                 padding: '6px 12px', 
@@ -405,7 +492,6 @@ function App() {
           {activeMenu === 'verify' && (
             <div>
               <h2 style={{ marginBottom: '10px' }}>Verifikasi Document</h2>
-              <p style={{ color: theme.textMuted, marginBottom: '30px' }}>Unggah dokumen PDF untuk mengekstrak dan memverifikasi keabsahan tanda tangan digital di dalamnya.</p>
               
               <div style={{ padding: '30px', backgroundColor: '#F9FAFB', borderRadius: '8px', border: `1px solid ${theme.border}` }}>
                 <input 
@@ -421,17 +507,52 @@ function App() {
                   Periksa Validitas
                 </button>
               </div>
-
+              {/* HASIL VERIFIKASI DOKUMEN */}
               {verifyResult && (
-                <div style={{ marginTop: '20px', padding: '20px', backgroundColor: '#ECFDF5', border: '1px solid #10B981', borderRadius: '8px' }}>
-                  <h3 style={{ color: '#047857', marginBottom: '10px', display: 'flex', alignItems: 'center', gap: '10px' }}>
-                    ✅ {verifyResult.message}
-                  </h3>
-                  <div style={{ color: '#065F46', fontSize: '15px' }}>
-                    <p style={{ margin: '5px 0' }}><strong>Nama Penandatangan:</strong> {verifyResult.signer}</p>
-                    <p style={{ margin: '5px 0' }}><strong>Waktu Tanda Tangan:</strong> {new Date(verifyResult.date).toLocaleString('id-ID')}</p>
-                    <p style={{ margin: '5px 0' }}><strong>Status Integritas:</strong> Dokumen belum dimodifikasi sejak ditandatangani.</p>
+                <div style={{ marginTop: '30px' }}>
+                  
+                  {/* KOTAK STATUS */}
+                  <div style={{ padding: '15px', backgroundColor: verifyResult.isValid ? '#ECFDF5' : '#FEF2F2', border: `1px solid ${verifyResult.isValid ? '#10B981' : '#EF4444'}`, borderRadius: '8px', marginBottom: '20px' }}>
+                    <h3 style={{ color: verifyResult.isValid ? '#047857' : '#991B1B', margin: 0, display: 'flex', alignItems: 'center', gap: '10px' }}>
+                      {verifyResult.isValid ? '✅' : '❌'} {verifyResult.message}
+                    </h3>
                   </div>
+
+                  {/* KARTU IDENTITAS SERTIFIKAT DIGITAL (.p12) */}
+                  {verifyResult.certificate && (
+                    <div style={{ backgroundColor: 'white', border: `1px solid ${theme.border}`, borderRadius: '8px', overflow: 'hidden', boxShadow: theme.shadow }}>
+                      
+                      <div style={{ backgroundColor: '#F3F4F6', padding: '12px 20px', borderBottom: `1px solid ${theme.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <strong style={{ color: '#374151', fontSize: '15px' }}>📜 Detail Sertifikat Kriptografi</strong>
+                        <span style={{ fontSize: '12px', backgroundColor: '#D1FAE5', color: '#065F46', padding: '2px 8px', borderRadius: '10px', fontWeight: 'bold' }}>Terverifikasi</span>
+                      </div>
+
+                      <div style={{ padding: '20px', display: 'grid', gridTemplateColumns: '130px 1fr', gap: '12px 10px', fontSize: '14px' }}>
+                        <div style={{ color: theme.textMuted }}>Penandatangan</div>
+                        <div style={{ fontWeight: 'bold', color: theme.primary, fontSize: '16px' }}>
+                          {verifyResult.certificate.signerName}
+                        </div>
+
+                        <div style={{ color: theme.textMuted }}>Penerbit (Issuer)</div>
+                        <div style={{ color: '#4B5563' }}>{verifyResult.certificate.issuerName}</div>
+
+                        <div style={{ color: theme.textMuted }}>Waktu TTD</div>
+                        <div style={{ color: '#4B5563' }}>{new Date(verifyResult.certificate.signedAt).toLocaleString('id-ID')}</div>
+
+                        <div style={{ color: theme.textMuted }}>Valid Hingga</div>
+                        <div style={{ color: '#B45309', fontWeight: '500' }}>
+                          {new Date(verifyResult.certificate.validUntil).toLocaleString('id-ID')}
+                        </div>
+
+                        <div style={{ color: theme.textMuted }}>Integritas Dokumen</div>
+                        <div style={{ color: '#059669' }}>
+                          Hash SHA-256 Cocok. Tidak ada modifikasi sejak ditandatangani.
+                        </div>
+                      </div>
+                      
+                    </div>
+                  )}
+
                 </div>
               )}
             </div>
@@ -444,18 +565,53 @@ function App() {
               <p style={{ color: theme.textMuted, marginBottom: '30px' }}>Kelola sertifikat dan otentikasi akun Anda.</p>
               
               <div style={{ marginBottom: '40px' }}>
-                <h3 style={{ fontSize: '16px', marginBottom: '15px' }}>1. Buat Sertifikat Baru (.p12)</h3>
-                <form onSubmit={handleRequestID}>
-                  <input type="text" placeholder="Nama Lengkap" required style={styles.input} onChange={e => setReqData({...reqData, name: e.target.value})} />
-                  <input type="password" placeholder="Passphrase Baru" required style={styles.input} onChange={e => setReqData({...reqData, passphrase: e.target.value})} />
-                  <button type="submit" style={{ ...styles.btn, backgroundColor: '#10B981', width: 'auto', padding: '10px 25px' }}>Request & Download</button>
-                </form>
+                <h3 style={{ fontSize: '16px', marginBottom: '15px' }}>1. Kelola Sertifikat Digital (.p12)</h3>
+                
+                {/* LOGIKA KONDISIONAL BERDASARKAN STATUS HAS_P12 */}
+                {hasP12 ? (
+                  // TAMPILAN JIKA USER SUDAH PERNAH MEMBUAT .P12
+                  <div>
+                    <div style={{ padding: '15px', backgroundColor: '#ECFDF5', border: '1px solid #10B981', borderRadius: '8px', color: '#047857', marginBottom: '20px', fontSize: '14px' }}>
+                      ✅ Anda sudah memiliki Digital ID aktif. Untuk menjaga integritas tanda tangan, Anda hanya diizinkan memiliki 1 sertifikat aktif per akun.
+                    </div>
+
+                    {/* FITUR EKSTRAK .CRT YANG SUDAH JADI */}
+                    <div style={{ backgroundColor: '#F9FAFB', padding: '20px', borderRadius: '8px', border: `1px solid ${theme.border}`, marginBottom: '20px' }}>
+                      <h4 style={{ marginTop: 0, marginBottom: '10px', fontSize: '15px' }}>🛠️ Ekstrak Sertifikat Publik (.crt)</h4>
+                      <p style={{ fontSize: '13px', color: theme.textMuted, marginBottom: '15px' }}>Unggah file .p12 Anda untuk mengambil sertifikat publiknya saja. File .crt ini aman dibagikan ke orang lain.</p>
+                      
+                      <form onSubmit={handleExtractCert}>
+                        <input type="file" accept=".p12,.pfx" required style={{ ...styles.input, backgroundColor: 'white' }} onChange={e => setExtractData({...extractData, file: e.target.files[0]})} />
+                        <input type="password" placeholder="Passphrase file .p12 Anda" required style={styles.input} onChange={e => setExtractData({...extractData, passphrase: e.target.value})} />
+                        <button type="submit" style={{ ...styles.btn, backgroundColor: theme.primary, width: 'auto', padding: '10px 25px', fontSize: '14px' }}>Ekstrak & Unduh .crt</button>
+                      </form>
+                    </div>
+
+                    {/* TOMBOL RESET .P12 */}
+                    <div style={{ backgroundColor: '#FEF2F2', padding: '20px', borderRadius: '8px', border: '1px solid #FCA5A5' }}>
+                      <h4 style={{ marginTop: 0, marginBottom: '10px', color: '#991B1B', fontSize: '15px' }}>Reset Digital ID</h4>
+                      <p style={{ fontSize: '13px', color: '#7F1D1D', marginBottom: '15px' }}>Kehilangan file .p12 atau lupa passphrase Anda? Klik tombol di bawah untuk menghapus akses sertifikat lama dan membuat sertifikat yang baru.</p>
+                      <button onClick={handleResetP12} style={{ ...styles.btn, backgroundColor: '#EF4444', width: 'auto', padding: '10px 25px', fontSize: '14px' }}>
+                        Reset Digital ID Saya
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  // TAMPILAN AWAL: JIKA USER BELUM PERNAH MEMBUAT .P12
+                  <form onSubmit={handleRequestID}>
+                    <p style={{ fontSize: '14px', color: theme.textMuted, marginBottom: '15px' }}>Anda belum memiliki sertifikat. Silakan buat sertifikat Digital ID Anda terlebih dahulu untuk dapat menandatangani dokumen.</p>
+                    <input type="text" placeholder="Nama Lengkap" required style={styles.input} onChange={e => setReqData({...reqData, name: e.target.value})} />
+                    <input type="password" placeholder="Passphrase Baru" required style={styles.input} onChange={e => setReqData({...reqData, passphrase: e.target.value})} />
+                    <button type="submit" style={{ ...styles.btn, backgroundColor: '#10B981', width: 'auto', padding: '10px 25px' }}>Request & Download .p12</button>
+                  </form>
+                )}
               </div>
 
+              {/* MENU 2FA AUTHENTICATOR (Biarkan tetap di bawah) */}
               <div style={{ borderTop: `1px solid ${theme.border}`, paddingTop: '30px' }}>
                 <h3 style={{ fontSize: '16px', marginBottom: '15px' }}>2. Reset Perangkat Authenticator</h3>
-                <p style={{ fontSize: '14px', color: theme.textMuted, marginBottom: '15px' }}>Gunakan ini jika Anda kehilangan akses ke perangkat *smartphone* Anda. Anda akan diminta melakukan *scan* ulang saat login berikutnya.</p>
-                <button style={{ ...styles.btnOutline, borderColor: '#E11D48', color: '#E11D48', width: 'auto', padding: '10px 25px' }} onClick={async () => {
+                <p style={{ fontSize: '14px', color: theme.textMuted, marginBottom: '15px' }}>Gunakan ini jika Anda kehilangan akses ke perangkat <i>smartphone</i> Anda.</p>
+                <button style={{ ...styles.btnOutline, borderColor: '#E11D48', color: '#E11D48', width: 'auto', padding: '10px 25px', marginTop: 0 }} onClick={async () => {
                   if(window.confirm('Reset OTP sekarang?')) {
                     await axios.post('https://dgsign.test:8081/reset-otp', { email });
                     setAppState('AUTH'); setPassword(''); setRole('user');
@@ -464,17 +620,29 @@ function App() {
                 }}>Reset Keamanan 2FA</button>
               </div>
             </div>
-          )}
+          )}  
 
-          {/* MENU 5: DASHBOARD ADMIN */}
-          {activeMenu === 'admin' && role === 'admin' && (
-            <AdminDashboard />
-          )}
-
-        </div>
-      </div>
+        {/* MENU 5: DASHBOARD ADMIN (SEKARANG BEBAS DI LUAR KOTAK PUTIH!) */}
+        {activeMenu === 'admin' && role === 'admin' && (
+          <AdminDashboard />
+        )}
+        </div> 
+      </div> {/* <--- Ini penutup styles.content, biarkan di sini */}
     </div>
   );
 }
 
+function App() {
+  return (
+    <Router>
+      <Routes>
+        <Route path="/" element={<MainApp />} />
+        <Route path="/verify/:uuid" element={<VerifyDocument />} />
+        <Route path="*" element={<MainApp />} />
+      </Routes>
+    </Router>
+  );
+}
+
+// SATU-SATUNYA baris export default harus ada di paling bawah ini
 export default App;

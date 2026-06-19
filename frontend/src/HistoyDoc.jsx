@@ -22,7 +22,7 @@ const HistoryDocument = ({ userEmail }) => {
       alert("Dokumen belum disetujui Admin. Tidak bisa diunduh.");
       return;
     }
-    window.open(`https://dgsign.test:8081/download?id=${id}`);
+    window.open(`https://dgsign.test:8081/download?token=${doc.file_token}`);
   };
 
   return (
@@ -45,7 +45,7 @@ const HistoryDocument = ({ userEmail }) => {
               </td>
               <td>
                 <button 
-                  onClick={() => handleDownload(h.id, h.status)}
+                  onClick={() => handleDownload(h.id, h.document_name, h.status, h.file_token)}
                   disabled={h.status !== 'disetujui'}
                   style={{ 
                     cursor: h.status === 'disetujui' ? 'pointer' : 'not-allowed', 

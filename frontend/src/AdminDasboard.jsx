@@ -10,7 +10,7 @@ const AdminDashboard = () => {
 
   const fetchAllHistory = async () => {
     try {
-      const res = await axios.get('http://localhost:8081/admin/history');
+      const res = await axios.get('https://dgsign.test:8081/admin/history');
       if (res.data) setAllHistories(res.data);
     } catch (err) {
       console.error(err);
@@ -20,7 +20,7 @@ const AdminDashboard = () => {
     const updateStatus = async (id, newStatus) => {
     if (!window.confirm(`Yakin ingin mengubah status dokumen ini menjadi ${newStatus.toUpperCase()}?`)) return;
     try {
-      const res = await axios.post('http://localhost:8081/admin/approve', {
+      const res = await axios.post('https://dgsign.test:8081/admin/approve', {
         document_id: id,
         status: newStatus
       });
@@ -34,7 +34,7 @@ const AdminDashboard = () => {
   };
 
   return (
-    <div>
+  <div> 
       <h2 style={{ color: '#E11D48' }}>Dashboard Administrator - Persetujuan Dokumen</h2>
       <table border="1" cellPadding="10" style={{ width: '100%', borderCollapse: 'collapse', marginTop: '20px' }}>
         <thead style={{ backgroundColor: '#F3F4F6' }}>
