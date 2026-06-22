@@ -128,6 +128,7 @@ func initDB() {
 		"ALTER TABLE users ADD COLUMN IF NOT EXISTS has_p12 BOOLEAN DEFAULT FALSE",
 		"ALTER TABLE users ADD COLUMN IF NOT EXISTS p12_path VARCHAR(500)",
 		"ALTER TABLE signed_documents ADD COLUMN IF NOT EXISTS scan_count INT DEFAULT 0",
+		"ALTER TABLE signed_documents ADD COLUMN IF NOT EXISTS scan_limit INT DEFAULT 1",
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			log.Printf("Gagal memastikan skema users (%s): %v", stmt, err)
@@ -186,10 +187,24 @@ func initDB() {
 		"ALTER TABLE signed_documents ADD COLUMN IF NOT EXISTS signer_name VARCHAR(255)",
 		"ALTER TABLE signed_documents ADD COLUMN IF NOT EXISTS issuer_name VARCHAR(255)",
 		"ALTER TABLE signed_documents ADD COLUMN IF NOT EXISTS valid_until DATETIME",
+		// Manajemen versi tanda tangan:
+		// document_hash   -> identitas dokumen (SHA-256 PDF sumber). Dokumen yang
+		//                    ditandatangani ulang akan menghasilkan document_hash yang
+		//                    sama, sehingga versi lamanya dapat dikenali & dicabut.
+		// signature_status-> "ACTIVE" (default) atau "REVOKED" bila telah digantikan
+		//                    oleh penandatanganan yang lebih baru (signature revocation).
+		"ALTER TABLE signed_documents ADD COLUMN IF NOT EXISTS document_hash VARCHAR(64)",
+		"ALTER TABLE signed_documents ADD COLUMN IF NOT EXISTS signature_status VARCHAR(20) DEFAULT 'ACTIVE'",
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			log.Printf("Gagal memastikan skema signed_documents (%s): %v", stmt, err)
 		}
+	}
+
+	// Index document_hash untuk mempercepat query revoke saat re-signing.
+	// Idempoten: error (mis. index sudah ada) diabaikan agar aman dijalankan ulang.
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_signed_documents_document_hash ON signed_documents (document_hash)"); err != nil {
+		log.Printf("Gagal membuat index document_hash (mungkin sudah ada): %v", err)
 	}
 
 	// --- TAMBAHAN UNTUK FITUR ALUR PENGAJUAN (WORKFLOW) ---
@@ -658,6 +673,39 @@ func webSignHandler(w http.ResponseWriter, r *http.Request) {
 	io.Copy(inputFile, pdfFile)
 	inputFile.Close()
 
+	// document_hash = identitas dokumen berupa SHA-256 dari PDF sumber (sebelum
+	// ditandatangani). Dipakai sebagai kunci pengelompokan versi tanda tangan:
+	// dokumen yang ditandatangani ulang memiliki document_hash yang sama,
+	// sehingga versi lamanya dapat dicabut (lihat signature revocation di bawah).
+	// (Berbeda dari hash_sha256 yang merupakan hash *output* dan berubah setiap
+	// penandatanganan, document_hash tetap stabil antar versi.)
+	sourceHash := ""
+
+	// Hitung hash file yang baru di-upload.
+	if sourceBytes, err := os.ReadFile(inputPdfPath); err == nil {
+		hashBytes := sha256.Sum256(sourceBytes)
+		uploadHash := hex.EncodeToString(hashBytes[:])
+
+		// Cek apakah file yang di-upload adalah output dari penandatanganan sebelumnya
+		// (yaitu PDF yang sudah distamp). Jika ya, warisi document_hash dari
+		// record sebelumnya agar chain revocation tetap terjaga lintas versi.
+		var existingDocHash sql.NullString
+		db.QueryRow(
+			"SELECT document_hash FROM signed_documents WHERE hash_sha256 = ? AND document_hash IS NOT NULL LIMIT 1",
+			uploadHash,
+		).Scan(&existingDocHash)
+
+		if existingDocHash.Valid && existingDocHash.String != "" {
+			// File yang di-upload adalah PDF yang sudah ditandatangani sebelumnya.
+			// Warisi document_hash agar versi sebelumnya bisa di-revoke.
+			sourceHash = existingDocHash.String
+		} else {
+			// File sumber baru / belum pernah ditandatangani.
+			// Hitung document_hash baru dari file ini.
+			sourceHash = uploadHash
+		}
+	}
+
 	inputPdf, _ := os.Open(inputPdfPath)
 	defer inputPdf.Close()
 	finfo, _ := inputPdf.Stat()
@@ -747,14 +795,27 @@ func webSignHandler(w http.ResponseWriter, r *http.Request) {
 		hash := sha256.Sum256(signedBytes)
 		fileHash = hex.EncodeToString(hash[:])
 	}
+
 	certSerial := cert.SerialNumber.String()
 
-	// Insert ke signed_documents
+	// Catat tanda tangan baru. Setiap penandatanganan menghasilkan Signature ID
+	// (uuid) baru dengan status ACTIVE.
 	db.Exec(`
-		INSERT INTO signed_documents 
-		(uuid, user_id, filename, file_path, hash_sha256, certificate_serial, signer_email, signed_at, verification_token, created_at, updated_at, signer_name, issuer_name, valid_until) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, uuidRecord, userID, pdfHeader.Filename, signedOutputPath, fileHash, certSerial, email, signedAt, fileHash, signedAt, signedAt, signerName, issuerName, validUntil)
+		INSERT INTO signed_documents
+		(uuid, user_id, filename, file_path, hash_sha256, certificate_serial, signer_email, signed_at, verification_token, created_at, updated_at, signer_name, issuer_name, valid_until, document_hash, signature_status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
+	`, uuidRecord, userID, pdfHeader.Filename, signedOutputPath, fileHash, certSerial, email, signedAt, fileHash, signedAt, signedAt, signerName, issuerName, validUntil, sourceHash)
+
+	// Signature revocation: ketika dokumen yang sama ditandatangani ulang,
+	// semua tanda tangan sebelumnya untuk document_hash yang sama dicabut
+	// (status -> REVOKED). Baris baru (uuidRecord) dikecualikan agar tetap ACTIVE.
+	// Dengan demikian hanya satu versi tanda tangan yang berlaku (latest wins),
+	// dan versi lama yang sudah tidak relevan otomatis dianggap tidak valid.
+	db.Exec(`
+		UPDATE signed_documents
+		SET signature_status = 'REVOKED'
+		WHERE document_hash = ? AND uuid <> ?
+	`, sourceHash, uuidRecord)
 
 	// Update Workflow (PENTING: pakai file_path agar kebaca di React)
 	historyStatus := "menunggu"
@@ -907,13 +968,28 @@ func verifySignedDocumentHandler(w http.ResponseWriter, r *http.Request) {
 		IssuerName        string
 		ValidUntil        time.Time
 		SignedAt          time.Time
+		SignatureStatus   string
+		ScanCount         int
+		ScanLimit         int
+		UserID            int
+		DocumentHash      string
 	}
 
-	// Bersih tanpa hitungan scan_count
-	err := db.QueryRow(`
-		SELECT uuid, filename, file_path, hash_sha256, certificate_serial, signer_name, signer_email, issuer_name, valid_until, signed_at
-		FROM signed_documents WHERE uuid = ?
-	`, uuid).Scan(&record.UUID, &record.Filename, &record.FilePath, &record.HashSHA256, &record.CertificateSerial, &record.SignerName, &record.SignerEmail, &record.IssuerName, &record.ValidUntil, &record.SignedAt)
+	selectColumns := `
+		SELECT uuid, filename, file_path, hash_sha256, certificate_serial, signer_name, signer_email, issuer_name, valid_until, signed_at,
+		       COALESCE(signature_status, 'ACTIVE'),
+		       COALESCE(scan_count, 0),
+		       COALESCE(scan_limit, 1),
+		       user_id,
+		       COALESCE(document_hash, '')
+	`
+	scanFields := func() []interface{} {
+		return []interface{}{
+			&record.UUID, &record.Filename, &record.FilePath, &record.HashSHA256, &record.CertificateSerial, &record.SignerName, &record.SignerEmail, &record.IssuerName, &record.ValidUntil, &record.SignedAt, &record.SignatureStatus, &record.ScanCount, &record.ScanLimit, &record.UserID, &record.DocumentHash,
+		}
+	}
+
+	err := db.QueryRow(selectColumns+" FROM signed_documents WHERE uuid = ?", uuid).Scan(scanFields()...)
 
 	if err != nil {
 		fmt.Println("[ERROR VERIFY DB]:", err)
@@ -921,8 +997,78 @@ func verifySignedDocumentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Proses pengecekan keaslian file (Hash Matching)
+	// Tahap 1 — Signature revocation + scan-limit rotation (looping).
+	// Jika signature yang dipindai (QR) sudah REVOKED, ikuti rantai ke record
+	// ACTIVE terbaru dengan document_hash yang sama. Karena QR di PDF bersifat
+	// statis (UUID lama), scan berikutnya harus tetap bisa "diteruskan" ke versi
+	// terbaru agar logika scan-limit terus berputar (looping) setiap kali batas
+	// tercapai.
+	if strings.EqualFold(strings.TrimSpace(record.SignatureStatus), "REVOKED") {
+		if record.DocumentHash == "" {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"isValid": false,
+				"status":  "REVOKED",
+				"message": "Dokumen ini telah digantikan oleh versi tanda tangan yang lebih baru. Silakan gunakan dokumen terbaru.",
+			})
+			return
+		}
+		err = db.QueryRow(selectColumns+`
+			FROM signed_documents
+			WHERE document_hash = ? AND COALESCE(signature_status, 'ACTIVE') = 'ACTIVE'
+			ORDER BY created_at DESC LIMIT 1
+		`, record.DocumentHash).Scan(scanFields()...)
 
+		if err != nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"isValid": false,
+				"status":  "REVOKED",
+				"message": "Dokumen ini telah digantikan oleh versi tanda tangan yang lebih baru. Silakan gunakan dokumen terbaru.",
+			})
+			return
+		}
+	}
+
+	// Tahap 1b — Scan limit enforcement (inti dari fitur looping).
+	// Setiap QR Code memiliki batas jumlah pemindaian (scan_limit). Jika batas
+	// tercapai, signature ini di-revoke dan dibuatkan record baru dengan UUID
+	// baru (menunjuk ke file & document_hash yang sama), sehingga QR ini tidak
+	// lagi VALID. Karena record baru juga ACTIVE, scan QR lama selanjutnya akan
+	// diteruskan ke record baru (Tahap 1) dan siklus berulang.
+	scanLimit := record.ScanLimit
+	if scanLimit <= 0 {
+		scanLimit = 1 // default
+	}
+
+	if record.ScanCount >= scanLimit {
+		// Revoke signature ini.
+		db.Exec("UPDATE signed_documents SET signature_status = 'REVOKED' WHERE uuid = ?", record.UUID)
+
+		// Generate record baru dengan UUID baru (file & data sama, document_hash diwarisi).
+		now := time.Now().UTC().Format("2006-01-02 15:04:05")
+		newUUID := fmt.Sprintf("%d-%x", time.Now().UnixNano(), record.SignerEmail)
+		newTokenBytes := sha256.Sum256([]byte(newUUID))
+		newToken := hex.EncodeToString(newTokenBytes[:])
+		db.Exec(`
+			INSERT INTO signed_documents
+			(uuid, user_id, filename, file_path, hash_sha256, certificate_serial, signer_name, signer_email, issuer_name, valid_until, signed_at, verification_token, created_at, updated_at, document_hash, signature_status, scan_count, scan_limit)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 0, ?)
+		`, newUUID, record.UserID, record.Filename, record.FilePath, record.HashSHA256, record.CertificateSerial, record.SignerName, record.SignerEmail, record.IssuerName, record.ValidUntil, now, newToken, now, now, record.DocumentHash, scanLimit)
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"isValid": false,
+			"status":  "SCAN_LIMIT_REACHED",
+			"message": "Batas verifikasi QR Code untuk dokumen ini telah tercapai. QR Code ini tidak lagi valid.",
+		})
+		return
+	}
+
+	// Increment scan count pada record ACTIVE yang sedang berlaku.
+	db.Exec("UPDATE signed_documents SET scan_count = scan_count + 1 WHERE uuid = ?", record.UUID)
+
+	// Tahap 2 — Document integrity verification (tamper detection).
+	// Bandingkan hash SHA-256 file PDF yang tersimpan di server dengan hash yang
+	// tercatat saat penandatanganan. Jika berbeda, berarti file fisik telah
+	// dimodifikasi setelah ditandatangani -> dokumen tidak valid.
 	cleanPath := filepath.Clean(record.FilePath)
 	isValid := false
 	if data, err := os.ReadFile(cleanPath); err == nil {
@@ -933,6 +1079,7 @@ func verifySignedDocumentHandler(w http.ResponseWriter, r *http.Request) {
 	// Kirim data ke React
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"isValid":           isValid,
+		"status":            "ACTIVE",
 		"signerName":        record.SignerName,
 		"signerEmail":       record.SignerEmail,
 		"issuerName":        record.IssuerName,
@@ -968,20 +1115,21 @@ func verifyDocumentHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 3. CARI DI DB BERDASARKAN HASH (Bukan Nama File)
 	var record struct {
-		UUID        string
-		SignerName  string
-		SignerEmail string
-		SignedAt    time.Time
-		ValidUntil  time.Time
-		IssuerName  string
+		UUID            string
+		SignerName      string
+		SignerEmail     string
+		SignedAt        time.Time
+		ValidUntil      time.Time
+		IssuerName      string
+		SignatureStatus string
 	}
 
 	// Cari apakah hash ini ada di database kita
 	err = db.QueryRow(`
-        SELECT uuid, signer_name, signer_email, signed_at, valid_until, issuer_name 
+        SELECT uuid, signer_name, signer_email, signed_at, valid_until, issuer_name, COALESCE(signature_status, 'ACTIVE') 
         FROM signed_documents 
         WHERE hash_sha256 = ?`, uploadedHash).Scan(
-		&record.UUID, &record.SignerName, &record.SignerEmail, &record.SignedAt, &record.ValidUntil, &record.IssuerName,
+		&record.UUID, &record.SignerName, &record.SignerEmail, &record.SignedAt, &record.ValidUntil, &record.IssuerName, &record.SignatureStatus,
 	)
 
 	// 4. JIKA TIDAK DITEMUKAN BERARTI DOKUMEN PALSU/DIMODIFIKASI
@@ -995,10 +1143,24 @@ func verifyDocumentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// --- FITUR VERSION-BASED SIGNATURE VALIDATION ---
+	// Jika hash output PDF cocok tapi status signature REVOKED, berarti ini versi
+	// tanda tangan lama yang sudah digantikan. Konsisten dengan endpoint QR.
+	if strings.EqualFold(strings.TrimSpace(record.SignatureStatus), "REVOKED") {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"isValid": false,
+			"status":  "REVOKED",
+			"message": "Dokumen ini telah digantikan oleh versi tanda tangan yang lebih baru. Silakan gunakan dokumen terbaru.",
+		})
+		return
+	}
+
 	// 5. JIKA KETEMU, BERARTI ASLI
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"isValid": true,
+		"status":  "ACTIVE",
 		"message": "Dokumen Asli & Tanda Tangan Valid",
 		"certificate": map[string]string{
 			"signerName":  record.SignerName,
@@ -1007,6 +1169,123 @@ func verifyDocumentHandler(w http.ResponseWriter, r *http.Request) {
 			"validUntil":  record.ValidUntil.Format("02 Jan 2006 15:04:05"),
 			"issuerName":  record.IssuerName,
 		},
+	})
+}
+
+// verifyFileHandler: pengecekan integritas file lebih lanjut dari halaman verifikasi QR.
+// User upload PDF fisik. Sistem membandingkan hash file dengan hash record UUID dari
+// URL QR. HANYA PDF yang cocok dengan record UUID itu (bukan versi/chain lain) yang
+// dianggap ASLI. Ini mendeteksi: PDF dipalsukan, ditukar, atau QR dipindah dari dokumen lain.
+func verifyFileHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	if r.Method != http.MethodPost {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"isValid": false,
+			"message": "Metode tidak diizinkan.",
+		})
+		return
+	}
+
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"isValid": false,
+			"message": "Gagal membaca file. Ukuran mungkin melebihi batas.",
+		})
+		return
+	}
+
+	// UUID dari URL QR (halaman verifikasi tempat user berada).
+	uuid := sanitizeString(r.FormValue("uuid"))
+	if uuid == "" {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"isValid": false,
+			"message": "QR Code tidak teridentifikasi.",
+		})
+		return
+	}
+
+	pdfFile, _, err := r.FormFile("file")
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"isValid": false,
+			"message": "File PDF tidak ditemukan pada permintaan.",
+		})
+		return
+	}
+	defer pdfFile.Close()
+
+	// Hitung hash PDF yang di-upload.
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, pdfFile); err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"isValid": false,
+			"message": "Gagal memproses file.",
+		})
+		return
+	}
+	uploadedHash := hex.EncodeToString(hasher.Sum(nil))
+
+	// Ambil record spesifik untuk UUID ini.
+	var record struct {
+		HashSHA256        string
+		SignatureStatus   string
+		SignerName        string
+		SignerEmail       string
+		IssuerName        string
+		CertificateSerial string
+		Filename          string
+		SignedAt          time.Time
+		ValidUntil        time.Time
+	}
+	err = db.QueryRow(`
+		SELECT hash_sha256, COALESCE(signature_status, 'ACTIVE'), signer_name, signer_email, issuer_name, certificate_serial, filename, signed_at, valid_until
+		FROM signed_documents WHERE uuid = ?
+	`, uuid).Scan(&record.HashSHA256, &record.SignatureStatus, &record.SignerName, &record.SignerEmail, &record.IssuerName, &record.CertificateSerial, &record.Filename, &record.SignedAt, &record.ValidUntil)
+
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"isValid": false,
+			"message": "QR Code tidak terdaftar di sistem.",
+		})
+		return
+	}
+
+	// FILTER UTAMA: hash PDF upload harus SAMA PERSIS dengan hash record UUID ini.
+	// Bukan chain/versi lain — hanya dokumen asli untuk UUID ini yang valid.
+	if uploadedHash != record.HashSHA256 {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"isValid": false,
+			"message": "Dokumen mungkin telah dipalsukan, ditukar, atau QR dipindahkan dari dokumen lain.",
+		})
+		return
+	}
+
+	// Hash cocok. Sampaikan status versi (REVOKED tetap disebut, tapi asli).
+	if strings.EqualFold(strings.TrimSpace(record.SignatureStatus), "REVOKED") {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"isValid":     false,
+			"status":      "REVOKED",
+			"isAuthentic": true,
+			"message":     "File PDF cocok dengan QR Code ini, namun tanda tangan sudah tidak berlaku karena ada versi yang lebih baru.",
+		})
+		return
+	}
+
+	// Hash cocok & ACTIVE => dokumen asli untuk UUID ini.
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"isValid":           true,
+		"isAuthentic":       true,
+		"status":            "ACTIVE",
+		"message":           "File PDF terverifikasi ASLI sesuai QR Code ini.",
+		"filename":          record.Filename,
+		"signerName":        record.SignerName,
+		"signerEmail":       record.SignerEmail,
+		"issuerName":        record.IssuerName,
+		"certificateSerial": record.CertificateSerial,
+		"signedAt":          record.SignedAt.Format("02 Jan 2006 15:04:05"),
+		"validUntil":        record.ValidUntil.Format("02 Jan 2006 15:04:05"),
 	})
 }
 
@@ -1451,6 +1730,7 @@ func main() {
 	mux.HandleFunc("/download", downloadDocumentHandler)
 	mux.HandleFunc("/download-signed", downloadSignedDocumentHandler)
 	mux.HandleFunc("/verify-pdf", verifyDocumentHandler)
+	mux.HandleFunc("/verify-file", verifyFileHandler)
 	mux.HandleFunc("/verify/", verifySignedDocumentHandler)
 	mux.HandleFunc("/request-id-lifecycle", requestDigitalIDLifecycleHandler)
 	mux.HandleFunc("/admin/update-status", adminUpdateLifecycleHandler)
